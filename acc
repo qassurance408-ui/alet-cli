@@ -1,0 +1,2379 @@
+#!/usr/bin/env python3
+"""acc — AletCloud CLI (MCP-backed).
+
+Same curated, abstracted feel as v4: human screens, friendly verbs, no MCP,
+no tool names, no JSON. Extended to cover the platform surfaces added since
+v4 — object storage, domains & DNS, VPN access, usage/transactions and
+platform status.
+"""
+import os
+import sys
+import json
+import http.client
+import ssl
+
+WINDOWS = os.name == "nt"
+if WINDOWS:
+    import msvcrt
+else:
+    import tty
+    import termios
+
+VERSION = "0.5"
+
+# ── Auth ──────────────────────────────────────────────────────────────────────
+CONFIG_FILE = os.path.expanduser("~/.config/aletcloud/config")
+
+def _load_pat() -> str | None:
+    """Resolve PAT from (in priority order):
+    1. ALET_PAT environment variable
+    2. ~/.config/aletcloud/config  (key=value format, line: ALET_PAT=<token>)
+    3. ~/.aletcloudrc              (same key=value format)
+    """
+    pat = os.environ.get("ALET_PAT")
+    if pat:
+        return pat.strip()
+
+    for path in (CONFIG_FILE, os.path.expanduser("~/.aletcloudrc")):
+        try:
+            with open(path) as f:
+                for line in f:
+                    line = line.strip()
+                    if line.startswith("#") or "=" not in line:
+                        continue
+                    key, _, val = line.partition("=")
+                    if key.strip() == "ALET_PAT" and val.strip():
+                        return val.strip()
+        except FileNotFoundError:
+            continue
+
+    return None
+
+
+def _validate_pat(token: str) -> tuple[bool, str]:
+    """Check a token by actually using it. Returns (accepted, reason).
+
+    The `initialize` handshake is NOT authenticated — it answers 200 and hands
+    out a session for any string at all — so checking its status proves nothing.
+    Only a real tool call exercises the token, and a bad one comes back as a
+    401 envelope inside an otherwise successful response.
+    """
+    global PAT
+    saved = PAT
+    PAT = token
+    try:
+        session = _open_session()
+        body, _ = _rpc({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                        "params": {"name": "getBalance", "arguments": {}}},
+                       session_id=session)
+        _unwrap(body)
+        return True, ""
+    except AletError as e:
+        reason = str(e)
+        # Tell "the server said no" apart from "we never reached the server".
+        if reason.startswith("Could not reach AletCloud"):
+            return False, reason
+        return False, reason or "The server rejected that token."
+    finally:
+        PAT = saved
+
+
+def _save_pat(token: str) -> None:
+    """Write ALET_PAT to the config file, creating it if needed."""
+    os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
+
+    existing = []
+    try:
+        with open(CONFIG_FILE) as f:
+            existing = f.readlines()
+    except FileNotFoundError:
+        pass
+
+    lines = [l for l in existing if not l.strip().startswith("ALET_PAT")]
+    lines.append(f"ALET_PAT={token}\n")
+
+    with open(CONFIG_FILE, "w") as f:
+        f.writelines(lines)
+
+    if not WINDOWS:
+        os.chmod(CONFIG_FILE, 0o600)  # owner read/write only — token is a secret
+    # On Windows chmod only toggles the read-only bit, so it would not actually
+    # restrict anyone; the file inherits the profile directory's ACL instead.
+
+
+def _prompt_for_pat() -> str:
+    """Interactive first-run setup. Loops until the user provides a valid PAT."""
+    B, G, Y, R, D, X = "\033[1m", "\033[38;5;83m", "\033[38;5;214m", "\033[38;5;196m", "\033[2m", "\033[0m"
+
+    print(f"\n{B}Welcome to AletCloud CLI!{X}")
+    print("No personal access token found. You need one to continue.")
+    print(f"{D}Generate a token at: {X}{Y}https://aletcloud.com/access-tokens{X}\n")
+
+    while True:
+        try:
+            token = input(f"{B}Paste your PAT: {X}").strip()
+        except (KeyboardInterrupt, EOFError):
+            print("\nAborted.")
+            sys.exit(0)
+
+        if not token:
+            print(f"{R}Token cannot be empty. Try again.{X}")
+            continue
+        if not token.startswith("alet_pat_"):
+            print(f"{R}That doesn't look like a valid token (expected it to start with alet_pat_).{X}")
+            continue
+
+        print("  Checking it against the platform… ", end="", flush=True)
+        accepted, reason = _validate_pat(token)
+        if accepted:
+            print(f"{G}✓ Works!{X}")
+            _save_pat(token)
+            print(f"  Token saved to {D}{CONFIG_FILE}{X}")
+            print("  You won't be asked again.\n")
+            return token
+        print(f"{R}✗{X}")
+        print(f"  {reason}")
+        print(f"  {D}Nothing was saved. Check the token and try again.{X}")
+
+
+MCP_HOST = "mcp.aletcloud.com"
+MCP_PATH = "/mcp"
+
+# ── Colors (AletCloud palette) ────────────────────────────────────────────────
+BOLD        = "\033[1m"
+BOLD_WHITE  = "\033[1;37m"
+BOLD_GREEN  = "\033[1;38;5;83m"   # vivid green — selected rows, headings, logo
+GREEN       = "\033[38;5;83m"     # vivid green — RUNNING / LIVE / ACTIVE
+YELLOW      = "\033[38;5;214m"    # amber-orange — STOPPED / transitional
+RED         = "\033[38;5;196m"    # bright red — errors
+LIME        = "\033[38;5;83m"     # URLs / connection strings
+DIM         = "\033[2m"
+GREY        = "\033[38;5;245m"    # muted grey — secondary text, nav hints
+RESET       = "\033[0m"
+HIDE_CURSOR = "\033[?25l"
+SHOW_CURSOR = "\033[?25h"
+
+# ── MCP transport (private — no screen below this line knows it exists) ───────
+PAT: str | None = None
+_session_id: str | None = None
+_next_id = 1
+
+
+class AletError(Exception):
+    """Anything the control plane refused or could not answer."""
+
+
+def _rpc(payload: dict, session_id: str | None = None) -> tuple[dict, str | None]:
+    headers = {
+        "Authorization": f"Bearer {PAT}",
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+        "Host": MCP_HOST,
+    }
+    if session_id:
+        headers["mcp-session-id"] = session_id
+
+    ctx = ssl.create_default_context()
+    conn = http.client.HTTPSConnection(MCP_HOST, context=ctx, timeout=60)
+    try:
+        conn.request("POST", MCP_PATH, body=json.dumps(payload).encode(), headers=headers)
+        resp = conn.getresponse()
+        returned_session = resp.getheader("mcp-session-id")
+
+        raw_bytes = bytearray()
+        while True:
+            try:
+                chunk = resp.read(8192)
+                if not chunk:
+                    break
+                raw_bytes.extend(chunk)
+            except http.client.IncompleteRead as e:
+                raw_bytes.extend(e.partial)
+                break
+
+        raw = raw_bytes.decode("utf-8", errors="replace")
+
+        # Responses arrive either as plain JSON or as an SSE `data:` stream.
+        body = None
+        for line in raw.splitlines():
+            line = line.strip()
+            if line.startswith("data:"):
+                candidate = line[len("data:"):].strip()
+                if candidate:
+                    try:
+                        body = json.loads(candidate)
+                    except json.JSONDecodeError:
+                        pass
+        if body is None:
+            try:
+                body = json.loads(raw.strip())
+            except json.JSONDecodeError:
+                raise AletError(f"Unreadable reply from the server (HTTP {resp.status}).")
+
+        return body, returned_session
+    except AletError:
+        raise
+    except Exception as e:
+        raise AletError(f"Could not reach AletCloud: {e}")
+    finally:
+        conn.close()
+
+
+def _open_session() -> str:
+    global _next_id
+    _next_id += 1
+    payload = {
+        "jsonrpc": "2.0", "id": _next_id, "method": "initialize",
+        "params": {
+            "protocolVersion": "2024-11-05", "capabilities": {},
+            "clientInfo": {"name": "acc", "version": VERSION},
+        },
+    }
+    _, session_id = _rpc(payload)
+    if not session_id:
+        raise AletError("The server did not open a session.")
+    return session_id
+
+
+def connect() -> None:
+    global _session_id
+    _session_id = _open_session()
+
+
+def _unwrap(body: dict):
+    """Turn a JSON-RPC reply into plain Python data, or raise AletError."""
+    if "error" in body:
+        raise AletError((body["error"] or {}).get("message") or "The request was rejected.")
+
+    result = body.get("result") or {}
+    content = result.get("content") or []
+    text = ""
+    for block in content:
+        if isinstance(block, dict) and block.get("type", "text") == "text":
+            text += block.get("text") or ""
+
+    if result.get("isError"):
+        raise AletError(text.strip() or "The request was rejected.")
+
+    text = text.strip()
+    if not text:
+        return None  # e.g. password change: success, no body
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return text  # a plain-language answer is still an answer
+
+    # The control plane reports application errors as an ordinary payload
+    # ({"error": true, "status": 404, "message": {...}}) rather than with the
+    # protocol's error flag — so catch it here, or screens render a 404 as data.
+    if isinstance(data, dict) and data.get("error") is True:
+        raise AletError(_describe_error(data))
+    return data
+
+
+def _describe_error(payload: dict) -> str:
+    """Turn the server's error envelope into one plain sentence."""
+    status = payload.get("status")
+    body = payload.get("message")
+
+    if isinstance(body, dict):
+        detail = body.get("message") or body.get("error")
+        fields = body.get("errors")
+        if isinstance(fields, dict) and fields:
+            detail = "; ".join(f"{k}: {val}" for k, val in fields.items())
+    else:
+        detail = body
+
+    detail = str(detail).strip() if detail else ""
+    if not detail:
+        detail = {401: "Your access token was not accepted.",
+                  403: "Your token is not allowed to do that.",
+                  404: "That resource no longer exists.",
+                  409: "That conflicts with something already there.",
+                  429: "Too many requests — try again shortly."}.get(status, "The request was rejected.")
+    return f"{detail}" if status is None else f"{detail}  (error {status})"
+
+
+def call(tool: str, arguments: dict | None = None):
+    """Invoke one control-plane operation. Raises AletError on failure."""
+    global _next_id, _session_id
+    if _session_id is None:
+        connect()
+
+    for attempt in (1, 2):
+        _next_id += 1
+        payload = {
+            "jsonrpc": "2.0", "id": _next_id, "method": "tools/call",
+            "params": {"name": tool, "arguments": _clean(arguments or {})},
+        }
+        body, _ = _rpc(payload, session_id=_session_id)
+        if "error" in body and attempt == 1:
+            msg = ((body.get("error") or {}).get("message") or "").lower()
+            if "session" in msg:  # session aged out — reopen once and retry
+                connect()
+                continue
+        return _unwrap(body)
+
+
+def _clean(args: dict) -> dict:
+    """Drop unset optional arguments so the server applies its own defaults."""
+    return {k: v for k, v in args.items() if v is not None and v != ""}
+
+
+# ── Terminal / menu utils ─────────────────────────────────────────────────────
+# Windows delivers arrows as a two-byte prefixed pair instead of an ANSI escape
+# sequence. Translate them so every caller can keep comparing against the one
+# vocabulary ("\x1b[A", "\x1b[B", ...) regardless of platform.
+_WIN_KEYS = {"H": "\x1b[A", "P": "\x1b[B", "K": "\x1b[D", "M": "\x1b[C"}
+
+
+def getch() -> str:
+    _painter.show()          # nothing is on screen until the frame is painted
+    if WINDOWS:
+        ch = msvcrt.getwch()
+        if ch in ("\x00", "\xe0"):          # arrow / function key prefix
+            return _WIN_KEYS.get(msvcrt.getwch(), "")
+        if ch == "\x1b":                     # bare Esc — Windows sends no tail
+            return "\x1b\x1b"
+        return ch
+
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        ch = sys.stdin.read(1)
+        if ch == "\x1b":
+            return ch + sys.stdin.read(1) + sys.stdin.read(1)
+        return ch
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+
+def _enable_ansi() -> None:
+    """Turn on virtual-terminal processing so the colour codes render as colour
+    rather than as literal escape bytes. Windows Terminal does this already;
+    the old conhost window does not."""
+    if not WINDOWS:
+        return
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8")   # box-drawing glyphs, ✓ and ✗
+        except Exception:
+            pass
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        for handle in (-11, -12):             # stdout, stderr
+            mode = ctypes.c_uint32()
+            h = kernel32.GetStdHandle(handle)
+            if kernel32.GetConsoleMode(h, ctypes.byref(mode)):
+                kernel32.SetConsoleMode(h, mode.value | 0x0004)
+    except Exception:
+        pass                                  # plain text is still readable
+
+
+ALT_ON = "\033[?1049h"
+ALT_OFF = "\033[?1049l"
+
+
+class _Painter:
+    """A stdout stand-in that paints a whole screen in one write.
+
+    The screens here are built with ordinary `print` calls, which is easy to
+    read but means a redraw arrives as dozens of separate writes. Unix
+    terminals coalesce those into one render pass; Windows consoles repaint per
+    write, so you watch the frame get erased and then painted back in line by
+    line — the flicker.
+
+    So: buffer everything a screen prints, and emit it as a single string that
+    homes the cursor and overwrites the previous frame in place. No erase-first
+    step, no gap. `\033[K` on each line clears whatever the old frame left
+    beyond the new line's end, and a trailing `\033[J` drops any rows the new
+    frame doesn't reach.
+    """
+
+    def __init__(self, real):
+        self._real = real
+        self._buf = None          # None → pass straight through, list → buffering
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+    def write(self, text: str) -> int:
+        if self._buf is None:
+            return self._real.write(text)
+        self._buf.append(text)
+        return len(text)
+
+    def flush(self) -> None:
+        if self._buf is None:
+            self._real.flush()
+
+    def raw_write(self, text: str) -> None:
+        """Emit immediately, bypassing the frame buffer (cursor/screen control)."""
+        self._real.write(text)
+        self._real.flush()
+
+    def begin(self) -> None:
+        """Start a new frame. The old one stays on screen until this one paints."""
+        self._buf = []
+
+    def show(self) -> None:
+        """Paint the frame so far. Safe to call repeatedly — it repaints from
+        the top each time, so a screen can grow (a spinner line, a prompt)
+        without a full redraw."""
+        if self._buf is None:
+            return
+        lines = "".join(self._buf).split("\n")
+        self._real.write("\033[H" + "\033[K\n".join(lines) + "\033[J")
+        self._real.flush()
+
+    def detach(self) -> None:
+        """Go back to plain pass-through output."""
+        self._buf = None
+
+
+_painter = _Painter(sys.stdout)
+sys.stdout = _painter
+_alt_screen = False
+
+
+def enter_ui() -> None:
+    """Switch to the alternate screen buffer so the full-screen UI never
+    disturbs the scrollback the user had before running acc."""
+    global _alt_screen
+    _painter.raw_write(ALT_ON + "\033[H" + HIDE_CURSOR)
+    _alt_screen = True
+
+
+def exit_ui() -> None:
+    """Undo enter_ui and stop buffering. Idempotent — every exit path calls it."""
+    global _alt_screen
+    _painter.detach()
+    if _alt_screen:
+        _painter.raw_write(ALT_OFF)
+        _alt_screen = False
+    _painter.raw_write(SHOW_CURSOR)
+
+
+def clear_screen():
+    _painter.begin()
+
+
+def header(title: str, subtitle: str = "", preamble: list[str] | None = None):
+    clear_screen()
+    print(f"\n  {BOLD_GREEN}alet{RESET} {GREY}—{RESET} {BOLD_WHITE}{title}{RESET}")
+    if subtitle:
+        print(f"  {GREY}{subtitle}{RESET}")
+    print(f"  {GREY}{'─' * 62}{RESET}\n")
+    if preamble:
+        for line in preamble:
+            print(line)
+        print()
+
+
+def menu(title: str, items: list[str], subtitle: str = "",
+         preamble: list[str] | None = None) -> int | None:
+    """Arrow-key menu. Returns the chosen index, or None on q/Esc.
+
+    `preamble` renders above the options and survives every redraw — use it for
+    context the user needs while choosing (a status panel, a warning).
+    """
+    if not items:
+        return None
+    idx = 0
+    _painter.raw_write(HIDE_CURSOR)
+    while True:
+        header(title, subtitle, preamble)
+        for i, item in enumerate(items):
+            if i == idx:
+                print(f"  {BOLD_GREEN}▶  {item}{RESET}")
+            else:
+                print(f"  {GREY}    {item}{RESET}")
+
+        print(f"\n  {GREY}↑/↓  navigate   enter  select   q  back{RESET}")
+
+        key = getch()
+        if key in ("\x1b[A", "k"):
+            idx = (idx - 1) % len(items)
+        elif key in ("\x1b[B", "j"):
+            idx = (idx + 1) % len(items)
+        elif key in ("\r", "\n"):
+            return idx
+        elif key in ("q", "\x1b\x1b", "\x03"):
+            return None
+
+
+def pick_from(items: list, label_fn, title: str, subtitle: str = ""):
+    choice = menu(title, [label_fn(i) for i in items], subtitle)
+    return items[choice] if choice is not None else None
+
+
+def pause(msg: str = "Press any key to continue..."):
+    print(f"\n  {GREY}{msg}{RESET}", flush=True)
+    getch()
+
+
+def loading(msg: str):
+    print(f"\n  {GREY}⟳  {msg}...{RESET}")
+    _painter.show()          # the wait is the point — show it now
+
+
+def confirm(msg: str) -> bool:
+    return menu(f"Confirm: {msg}", ["Yes, proceed", "No, cancel"]) == 0
+
+
+def danger_confirm(msg: str, consequence: str) -> bool:
+    """Confirmation that spells out what is irreversible before asking."""
+    return menu(f"Confirm: {msg}",
+                ["No, cancel", "Yes — I understand, do it"],
+                f"⚠  {consequence}") == 1
+
+
+def ask(prompt: str, default: str | None = None, required: bool = True) -> str | None:
+    """Free-text prompt. Returns None if the user backs out with an empty line."""
+    hint = f" {GREY}[{default}]{RESET}" if default else ""
+    while True:
+        print(f"  {BOLD}{prompt}{RESET}{hint}{GREY}:{RESET} ", end="")
+        _painter.show()
+        _painter.raw_write(SHOW_CURSOR)
+        try:
+            val = input().strip()
+        except (KeyboardInterrupt, EOFError):
+            print()
+            return None
+        if not val and default is not None:
+            return default
+        if not val:
+            if not required:
+                return ""
+            print(f"  {GREY}(empty — press Ctrl-C to go back){RESET}")
+            continue
+        return val
+
+
+def ask_int(prompt: str, default: int | None = None, required: bool = True) -> int | None:
+    while True:
+        raw = ask(prompt, str(default) if default is not None else None, required)
+        if raw is None:
+            return None
+        if raw == "":
+            return None
+        try:
+            return int(raw)
+        except ValueError:
+            print(f"  {RED}Please enter a whole number.{RESET}")
+
+
+def ask_yes_no(prompt: str) -> bool:
+    return menu(prompt, ["Yes", "No"]) == 0
+
+
+def ok(msg: str):
+    print(f"\n  {GREEN}✓{RESET}  {msg}")
+
+
+def fail(msg: str):
+    print(f"\n  {RED}✗{RESET}  {msg}")
+
+
+def error_screen(what: str, err: Exception):
+    clear_screen()
+    print(f"\n  {RED}✗  {what}{RESET}\n")
+    print(f"  {GREY}{err}{RESET}")
+    pause()
+
+
+# ── Formatters ────────────────────────────────────────────────────────────────
+def v(d: dict, key: str, default: str = "—"):
+    """Null-safe field read — the API sends JSON null for 'unset', not a missing key."""
+    val = d.get(key)
+    if val is None or val == "":
+        return default
+    return val
+
+
+def num(x):
+    """Coerce to float, or None. Some endpoints send numbers as strings."""
+    if isinstance(x, bool) or x is None or x == "":
+        return None
+    try:
+        return float(x)
+    except (TypeError, ValueError):
+        return None
+
+
+def _state_color(state: str) -> str:
+    u = str(state).upper()
+    if u in ("RUNNING", "LIVE", "ACTIVE", "OPERATIONAL", "AVAILABLE", "SUCCEEDED"):
+        return GREEN
+    if u in ("STOPPED", "BUILDING", "PROVISIONING", "PENDING", "DEPLOYING",
+             "DEGRADED", "DELETING", "MAINTENANCE", "RESTARTING"):
+        return YELLOW
+    if u in ("ERROR", "FAILED", "DOWN", "OUTAGE", "SUSPENDED", "EXPIRED"):
+        return RED
+    return GREY
+
+
+def paint(state: str) -> str:
+    """One status palette for every resource on the platform."""
+    u = str(state).upper()
+    return f"{_state_color(u)}{u}{RESET}"
+
+
+def status_cell(state: str, width: int = 12) -> str:
+    """Padded status for table columns — pads inside the colour codes, so the
+    invisible escape bytes never count toward the column width."""
+    u = str(state).upper()
+    return f"{_state_color(u)}{u:<{width}}{RESET}"
+
+
+def dot(state: str) -> str:
+    u = str(state).upper()
+    if u in ("RUNNING", "LIVE", "ACTIVE", "OPERATIONAL"):
+        return f"{GREEN}●{RESET}"
+    if u in ("ERROR", "FAILED", "DOWN", "OUTAGE"):
+        return f"{RED}●{RESET}"
+    if u in ("STOPPED", "BUILDING", "PROVISIONING", "PENDING", "DEGRADED", "DELETING"):
+        return f"{YELLOW}●{RESET}"
+    return f"{GREY}●{RESET}"
+
+
+def _engine_icon(engine: str) -> str:
+    return {"MYSQL": "🐬", "POSTGRESQL": "🐘", "MONGODB": "🍃"}.get(str(engine).upper(), "🗄")
+
+
+def fmt_etb(n) -> str:
+    try:
+        return f"ETB {float(n):,.2f}"
+    except (TypeError, ValueError):
+        return "—"
+
+
+def fmt_mb(mb) -> str:
+    try:
+        mb = int(mb)
+    except (TypeError, ValueError):
+        return "—"
+    return f"{mb // 1024} GB" if mb >= 1024 else f"{mb} MB"
+
+
+def fmt_bytes(n) -> str:
+    try:
+        n = float(n)
+    except (TypeError, ValueError):
+        return "—"
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return f"{n:,.1f} {unit}" if unit != "B" else f"{int(n)} B"
+        n /= 1024
+    return f"{n:,.1f} TB"
+
+
+def fmt_dt(s, width: int = 19) -> str:
+    if not s:
+        return "—"
+    return str(s)[:width].replace("T", " ")
+
+
+def bar(fraction: float, width: int = 26) -> str:
+    fraction = max(0.0, min(1.0, fraction))
+    filled = int(round(fraction * width))
+    color = GREEN if fraction < 0.75 else YELLOW if fraction < 0.9 else RED
+    return f"{color}{'█' * filled}{RESET}{GREY}{'░' * (width - filled)}{RESET}"
+
+
+def kv(label: str, value, width: int = 18):
+    print(f"  {GREY}{label:<{width}}{RESET} {value}")
+
+
+def trunc(s, n: int) -> str:
+    s = str(s)
+    return s if len(s) <= n else s[: n - 1] + "…"
+
+
+def _page_size() -> int:
+    """Rows of body text that fit, leaving room for the header and footer."""
+    try:
+        rows = os.get_terminal_size().lines
+    except OSError:
+        rows = 24
+    return max(5, rows - 12)
+
+
+def show_rows(title: str, subtitle: str, rows: list[str],
+              column_head: str | None = None, footer: list[str] | None = None,
+              empty: str = "Nothing to show.", unit: str = "rows"):
+    """Pager for anything long enough to scroll off the top. Rows print verbatim."""
+    if not rows:
+        header(title, subtitle)
+        print(f"  {GREY}{empty}{RESET}")
+        pause()
+        return
+
+    size = _page_size() - (1 if column_head else 0) - len(footer or [])
+    size = max(3, size)
+    pages = max(1, (len(rows) + size - 1) // size)
+    page = 0
+    while True:
+        note = f"{subtitle}   ({len(rows)} {unit}"
+        note += f", page {page + 1}/{pages})" if pages > 1 else ")"
+        header(title, note)
+        if column_head:
+            print(column_head)
+        for line in rows[page * size:(page + 1) * size]:
+            print(line)
+        for line in (footer or []):
+            print(line)
+        nav = "n  next   p  previous   q  back" if pages > 1 else "q  back"
+        print(f"\n  {GREY}{nav}{RESET}")
+        key = getch()
+        if key in ("q", "\x1b\x1b", "\x03", "\r", "\n"):
+            return
+        if key in ("n", "\x1b[B", "j") and page < pages - 1:
+            page += 1
+        elif key in ("p", "\x1b[A", "k") and page > 0:
+            page -= 1
+
+
+def show_lines(title: str, subtitle: str, lines: list[str], empty: str = "Nothing to show."):
+    """Pager for log output and other long, flat text."""
+    show_rows(title, subtitle, [f"  {GREY}{l}{RESET}" for l in lines],
+              empty=empty, unit="lines")
+
+
+# ── Screen scaffolding ────────────────────────────────────────────────────────
+def load(what: str, tool: str, arguments: dict | None = None):
+    """Fetch for display. Returns None (after showing the problem) on failure."""
+    loading(f"Fetching {what}")
+    try:
+        return call(tool, arguments)
+    except AletError as e:
+        error_screen(f"Could not fetch {what}", e)
+        return None
+
+
+def refreshed(record: dict, tool: str, id_field: str) -> dict:
+    """Re-read one record before showing its detail screen.
+
+    List payloads carry every field, but they age while the user sits in the
+    action menu. If the re-read fails we simply show what we already had.
+    """
+    loading("Refreshing")
+    try:
+        fresh = call(tool, {id_field: record["id"]})
+    except (AletError, KeyError):
+        return record
+    return fresh if isinstance(fresh, dict) and fresh.get("id") else record
+
+
+def act(doing: str, done: str, tool: str, arguments: dict | None = None):
+    """Run a mutation with a spinner and a plain-language result. Returns data or False."""
+    loading(doing)
+    try:
+        result = call(tool, arguments)
+    except AletError as e:
+        clear_screen()
+        fail(f"{doing} failed.")
+        print(f"\n  {GREY}{e}{RESET}")
+        pause()
+        return False
+    clear_screen()
+    ok(done)
+    pause()
+    return result if result is not None else True
+
+
+def browse(title: str, subtitle: str, fetch, label_fn, open_fn,
+           create_label: str | None = None, create_fn=None,
+           empty: str = "Nothing here yet."):
+    """The list → pick → act loop every section shares."""
+    while True:
+        items = fetch()
+        if items is None:
+            return
+        if not isinstance(items, list):
+            items = [items]
+
+        labels = [label_fn(i) for i in items]
+        tail = ([create_label] if create_fn else []) + ["← Back"]
+        note = subtitle if items else f"{empty}"
+
+        choice = menu(title, labels + tail, note)
+        if choice is None or choice == len(labels) + len(tail) - 1:
+            return
+        if create_fn and choice == len(labels):
+            create_fn()
+            continue
+        open_fn(items[choice])
+
+
+def actions(title: str, subtitle: str, options: list[tuple[str, object]]):
+    """Contextual action menu. `options` is [(label, handler-or-None)].
+
+    A handler returning "back" closes the menu (used after start/stop/delete,
+    where the resource we are holding is now stale).
+    """
+    labels = [label for label, _ in options] + ["← Back"]
+    while True:
+        choice = menu(title, labels, subtitle)
+        if choice is None or choice == len(labels) - 1:
+            return
+        handler = options[choice][1]
+        if handler and handler() == "back":
+            return
+
+
+def pick_plan(what: str, tool: str, label_fn, arguments: dict | None = None):
+    plans = load(f"{what} plans", tool, arguments)
+    if not plans:
+        return None
+    return pick_from(plans, label_fn, f"Choose a {what} plan", "Prices are per month")
+
+
+# ── Virtual Machines ──────────────────────────────────────────────────────────
+def vm_label(m: dict) -> str:
+    return (f"{trunc(v(m, 'name'), 22):<22} {dot(v(m, 'status', ''))} "
+            f"{status_cell(v(m, 'status', '?'))} "
+            f"{GREY}{trunc(v(m, 'planName'), 8):<8} {v(m, 'publicIpAddress')}{RESET}")
+
+
+def vm_plan_label(p: dict) -> str:
+    return (f"{trunc(v(p, 'name'), 10):<10} {GREY}{p.get('vcpus','?')} vCPU  "
+            f"{fmt_mb(p.get('memoryMb')):<7} {p.get('diskGb','?')} GB SSD   "
+            f"{fmt_etb(p.get('priceMonthly'))}/mo{RESET}")
+
+
+def vm_image_label(i: dict) -> str:
+    tag = f" {GREY}[LTS]{RESET}" if i.get("lts") else ""
+    return f"{trunc(v(i, 'name'), 30):<30}{tag}"
+
+
+def print_vm_detail(m: dict):
+    m = refreshed(m, "getVm", "vmId")
+    header(v(m, "name"), f"Virtual machine   {paint(v(m, 'status', '?'))}")
+    kv("Plan", v(m, "planName"))
+    kv("vCPUs", v(m, "vcpus"))
+    kv("Memory", fmt_mb(m.get("memoryMb")))
+    kv("Disk", f"{v(m, 'diskGb', '?')} GB base + {m.get('additionalStorageGb') or 0} GB extra")
+    kv("Image", v(m, "imageName"))
+    kv("Public IP", v(m, "publicIpAddress", "not assigned"))
+    kv("Private IP", v(m, "ipAddress"))
+    kv("Region", v(m, "region"))
+    kv("Project", v(m, "projectName"))
+    kv("Monthly", fmt_etb(m.get("effectiveMonthly")))
+    kv("Hourly", f"ETB {float(m.get('priceHourly') or 0):.4f}")
+    kv("Backups", "Enabled" if m.get("autoBackupEnabled") else "Disabled")
+    kv("Console", v(m, "consoleType"))
+    kv("Created", fmt_dt(m.get("createdAt")))
+    if m.get("statusMessage"):
+        print(f"\n  {YELLOW}{m['statusMessage']}{RESET}")
+    pause()
+
+
+def vm_stats(m: dict):
+    s = load(f"live stats for {v(m, 'name')}", "vmStats", {"vmId": m["id"]})
+    if s is None:
+        return
+    if not isinstance(s, dict):
+        show_lines(f"{v(m, 'name')} — live stats", "", str(s).splitlines())
+        return
+    header(v(m, "name"), "Live resource usage")
+    cpu = num(s.get("cpuPercent", s.get("cpu")))
+    if cpu is not None:
+        kv("CPU", f"{bar(cpu / 100)}  {cpu:.1f}%")
+    mem_u, mem_t = num(s.get("memoryUsedMb")), num(s.get("memoryTotalMb"))
+    if mem_u is not None and mem_t:
+        kv("Memory", f"{bar(mem_u / mem_t)}  {fmt_mb(mem_u)} / {fmt_mb(mem_t)}")
+    dsk_u, dsk_t = num(s.get("diskUsedGb")), num(s.get("diskTotalGb"))
+    if dsk_u is not None and dsk_t:
+        kv("Disk", f"{bar(dsk_u / dsk_t)}  {dsk_u:.1f} / {dsk_t} GB")
+    if s.get("uptimeSeconds"):
+        kv("Uptime", f"{int(s['uptimeSeconds']) // 3600} h")
+    for label, key in (("Net in", "networkInBytes"), ("Net out", "networkOutBytes")):
+        if s.get(key) is not None:
+            kv(label, fmt_bytes(s[key]))
+    # Anything the platform adds later still shows up, just unstyled.
+    shown = {"cpuPercent", "cpu", "memoryUsedMb", "memoryTotalMb", "diskUsedGb",
+             "diskTotalGb", "uptimeSeconds", "networkInBytes", "networkOutBytes"}
+    for k, val in s.items():
+        if k not in shown and not isinstance(val, (dict, list)):
+            kv(k, val)
+    pause()
+
+
+def vm_console(m: dict):
+    data = load(f"a console for {v(m, 'name')}", "getVmConsole", {"vmId": m["id"]})
+    if data is None:
+        return
+    url = data.get("url") or data.get("consoleUrl") if isinstance(data, dict) else data
+    header(v(m, "name"), "Web console")
+    print(f"  {GREY}Open this one-time link in a browser to reach the machine's screen.{RESET}\n")
+    print(f"  {LIME}{url}{RESET}\n")
+    print(f"  {GREY}The link is single-use and expires shortly.{RESET}")
+    pause()
+
+
+def vm_password(m: dict):
+    header(v(m, "name"), "Reset root password")
+    print(f"  {GREY}Sets a new root password. At least 6 characters.{RESET}\n")
+    pw = ask("New root password")
+    if not pw:
+        return
+    if len(pw) < 6:
+        fail("Password must be at least 6 characters.")
+        pause()
+        return
+    if not confirm(f"Reset the root password on '{v(m, 'name')}'?"):
+        return
+    act("Resetting password", f"Root password changed on {v(m, 'name')}.",
+        "changeVmPassword", {"vmId": m["id"], "password": pw})
+
+
+def vm_resize(m: dict):
+    plan = pick_plan("VM", "listVmPlans", vm_plan_label)
+    if not plan:
+        return
+    header(v(m, "name"), "Resize")
+    print(f"  {GREY}Extra storage beyond the plan's base disk. Leave blank to keep it as is.{RESET}\n")
+    extra = ask_int("Additional storage (GB)", required=False)
+    if not confirm(f"Resize '{v(m, 'name')}' to {v(plan, 'name')}?"):
+        return
+    act("Resizing", f"{v(m, 'name')} is being resized to {v(plan, 'name')}.",
+        "resizeVm", {"vmId": m["id"], "planId": plan["id"], "additionalStorageGb": extra})
+    return "back"
+
+
+def vm_rebuild(m: dict):
+    images = load("OS images", "listVmImages")
+    if not images:
+        return
+    image = pick_from(images, vm_image_label, "Rebuild — choose an OS image",
+                      "The machine is reinstalled from scratch")
+    if not image:
+        return
+    if not danger_confirm(f"Rebuild '{v(m, 'name')}' with {v(image, 'name')}?",
+                          "Every file on this machine is erased. This cannot be undone."):
+        return
+    act("Rebuilding", f"{v(m, 'name')} is being rebuilt from {v(image, 'name')}.",
+        "rebuildVm", {"vmId": m["id"], "imageId": image["id"]})
+    return "back"
+
+
+def vm_create():
+    header("New virtual machine", "A few details and it provisions in the background")
+    name = ask("Name")
+    if not name:
+        return
+    plan = pick_plan("VM", "listVmPlans", vm_plan_label)
+    if not plan:
+        return
+    images = load("OS images", "listVmImages")
+    if not images:
+        return
+    image = pick_from(images, vm_image_label, "Choose an OS image")
+    if not image:
+        return
+
+    header("New virtual machine", f"{name} — {v(plan, 'name')} — {v(image, 'name')}")
+    print(f"  {GREY}Access: paste an SSH public key, or leave blank to set a root password.{RESET}\n")
+    ssh = ask("SSH public key", required=False)
+    password = None
+    if not ssh:
+        password = ask("Root password (min 6 chars)")
+        if not password:
+            return
+    public_ip = ask_yes_no("Give this machine a public IP address?")
+
+    if not confirm(f"Create '{name}' on the {v(plan, 'name')} plan?"):
+        return
+    act("Creating the machine", f"{name} is provisioning. It appears in the list shortly.",
+        "createVm", {"name": name, "planId": plan["id"], "imageId": image["id"],
+                     "sshKey": ssh or None, "password": password,
+                     "addPublicIp": public_ip})
+
+
+def vm_power(m: dict, verb: str, tool: str):
+    def run():
+        if not confirm(f"{verb} '{v(m, 'name')}'?"):
+            return
+        act(f"{verb}ping {v(m, 'name')}" if verb == "Stop" else f"{verb}ing {v(m, 'name')}",
+            f"{verb} sent for {v(m, 'name')}.", tool, {"vmId": m["id"]})
+        return "back"
+    return run
+
+
+def vm_delete(m: dict):
+    if not danger_confirm(f"Delete '{v(m, 'name')}'?",
+                          "The machine and its disks are destroyed permanently."):
+        return
+    act("Deleting", f"{v(m, 'name')} has been deleted.", "deleteVm", {"vmId": m["id"]})
+    return "back"
+
+
+def open_vm(m: dict):
+    status = str(v(m, "status", "")).upper()
+    opts: list[tuple[str, object]] = [
+        ("View details", lambda: print_vm_detail(m)),
+        ("Live stats", lambda: vm_stats(m)),
+        ("Open web console", lambda: vm_console(m)),
+    ]
+    if status == "STOPPED":
+        opts.append(("Start", vm_power(m, "Start", "startVm")))
+    if status == "RUNNING":
+        opts.append(("Stop", vm_power(m, "Stop", "stopVm")))
+        opts.append(("Reboot", vm_power(m, "Reboot", "restartVm")))
+    opts += [
+        ("Resize", lambda: vm_resize(m)),
+        ("Reset root password", lambda: vm_password(m)),
+        ("Rebuild from image", lambda: vm_rebuild(m)),
+        ("Delete", lambda: vm_delete(m)),
+    ]
+    actions(f"VM: {v(m, 'name')}", f"{paint(status)}   {v(m, 'planName')}   {v(m, 'publicIpAddress', 'no public IP')}", opts)
+
+
+def screen_vms():
+    browse("Virtual Machines", "Choose a machine",
+           lambda: load("virtual machines", "listVms"),
+           vm_label, open_vm,
+           "＋  New virtual machine", vm_create,
+           "You don't have any machines yet.")
+
+
+# ── App Hosting ───────────────────────────────────────────────────────────────
+def app_label(a: dict) -> str:
+    return (f"{trunc(v(a, 'appName'), 26):<26} {dot(v(a, 'status', ''))} "
+            f"{status_cell(v(a, 'status', '?'))} {GREY}{trunc(v(a, 'framework'), 12):<12} "
+            f"{trunc(v(a, 'url', ''), 34)}{RESET}")
+
+
+def print_app_detail(a: dict):
+    a = refreshed(a, "getApp", "appId")
+    header(v(a, "appName"), f"Hosted app   {paint(v(a, 'status', '?'))}")
+    kv("Framework", v(a, "framework"))
+    kv("Render", v(a, "renderType"))
+    kv("Plan", v(a, "planName"))
+    kv("Repository", v(a, "githubRepoUrl"))
+    kv("Branch", v(a, "branch"))
+    kv("Build", v(a, "buildCommand"))
+    kv("Output dir", v(a, "outputDir"))
+    kv("Route", v(a, "pathPrefix", "/"))
+    kv("URL", f"{LIME}{v(a, 'url')}{RESET}")
+    kv("Domain", f"{v(a, 'domainType')}  {v(a, 'customDomain', '')}".strip())
+    kv("CPU limit", v(a, "cpuLimit"))
+    kv("Memory", v(a, "memoryLimit"))
+    kv("Replicas", v(a, "replicas"))
+    kv("Deployed", fmt_dt(a.get("lastDeployedAt")))
+    kv("Created", fmt_dt(a.get("createdAt")))
+    if a.get("statusMessage"):
+        print(f"\n  {YELLOW}{a['statusMessage']}{RESET}")
+    pause()
+
+
+def app_logs(a: dict):
+    data = load(f"logs for {v(a, 'appName')}", "appLogs", {"appId": a["id"], "lines": 300})
+    if data is None:
+        return
+    lines = data.get("lines") if isinstance(data, dict) else data
+    if isinstance(lines, str):
+        lines = lines.splitlines()
+    show_lines(f"{v(a, 'appName')} — logs", "Most recent first", lines or [],
+               "No log output yet.")
+
+
+def app_env(a: dict):
+    while True:
+        data = load(f"environment for {v(a, 'appName')}", "getAppEnv", {"appId": a["id"]})
+        if data is None:
+            return
+        env = data.get("envVars") if isinstance(data, dict) and "envVars" in data else data
+        env = env if isinstance(env, dict) else {}
+
+        rows = [f"{k:<28} {GREY}{trunc(val, 34)}{RESET}" for k, val in sorted(env.items())]
+        choice = menu(f"{v(a, 'appName')} — environment",
+                      rows + ["＋  Add or change a variable", "✕  Remove a variable", "← Back"],
+                      f"{len(env)} variable(s). Changes redeploy on the next build.")
+        if choice is None or choice == len(rows) + 2:
+            return
+
+        if choice < len(rows):
+            key = sorted(env)[choice]
+            header(v(a, "appName"), f"Environment variable — {key}")
+            print(f"  {GREY}Value:{RESET}\n\n  {LIME}{env[key]}{RESET}")
+            pause()
+            continue
+
+        if choice == len(rows):  # add / change
+            key = ask("Variable name")
+            if not key:
+                continue
+            val = ask("Value", required=False)
+            if val is None:
+                continue
+            merged = dict(env)
+            merged[key] = val
+            if not confirm(f"Set {key} on '{v(a, 'appName')}'?"):
+                continue
+            act("Updating environment", f"{key} saved.",
+                "setAppEnv", {"appId": a["id"], "envVars": merged})
+        else:  # remove
+            if not env:
+                continue
+            key = pick_from(sorted(env), lambda k: k, "Remove which variable?")
+            if not key:
+                continue
+            merged = {k: val for k, val in env.items() if k != key}
+            if not danger_confirm(f"Remove {key}?", "The app loses this value on its next start."):
+                continue
+            act("Updating environment", f"{key} removed.",
+                "setAppEnv", {"appId": a["id"], "envVars": merged})
+
+
+def app_route(a: dict):
+    header(v(a, "appName"), "Serve this app at a path")
+    print(f"  {GREY}Several apps can share one project domain, each under its own path.{RESET}\n")
+    prefix = ask("Path prefix", v(a, "pathPrefix", "/"))
+    if not prefix:
+        return
+    loading("Checking the path is free")
+    try:
+        check = call("checkAppPath", {"subdomain": a.get("subdomain"),
+                                      "customDomain": a.get("customDomain"),
+                                      "pathPrefix": prefix})
+    except AletError as e:
+        error_screen("Could not check that path", e)
+        return
+    available = check.get("available", True) if isinstance(check, dict) else True
+    if not available:
+        clear_screen()
+        fail(f"'{prefix}' is already taken on this domain.")
+        reason = check.get("reason") or check.get("message") if isinstance(check, dict) else None
+        if reason:
+            print(f"\n  {GREY}{reason}{RESET}")
+        pause()
+        return
+    if not confirm(f"Serve '{v(a, 'appName')}' at {prefix}?"):
+        return
+    act("Setting the route", f"{v(a, 'appName')} now answers at {prefix}.",
+        "setAppRoute", {"projectId": a["projectId"], "appId": a["id"], "pathPrefix": prefix})
+
+
+def app_domain(a: dict):
+    choice = menu(f"{v(a, 'appName')} — domain",
+                  ["Use a custom domain I own", "Go back to a random AletCloud subdomain", "← Back"],
+                  f"Currently: {v(a, 'url')}")
+    if choice is None or choice == 2:
+        return
+    if choice == 0:
+        header(v(a, "appName"), "Custom domain")
+        print(f"  {GREY}Point the domain at AletCloud first, then attach it here.{RESET}\n")
+        domain = ask("Domain (e.g. www.example.com)")
+        if not domain:
+            return
+        if not confirm(f"Serve '{v(a, 'appName')}' at {domain}?"):
+            return
+        act("Attaching the domain", f"{domain} attached to {v(a, 'appName')}.",
+            "configureAppDomain", {"appId": a["id"], "domainType": "CUSTOM", "customDomain": domain})
+    else:
+        if not confirm("Revert to a random AletCloud subdomain?"):
+            return
+        act("Updating the domain", f"{v(a, 'appName')} is back on an AletCloud subdomain.",
+            "configureAppDomain", {"appId": a["id"], "domainType": "RANDOM"})
+
+
+FRAMEWORK_HINTS = [
+    ("Static site (plain HTML/CSS/JS)", "STATIC"),
+    ("Node.js server",                  "NODEJS"),
+    ("Angular",                         "ANGULAR"),
+    ("Vite",                            "VITE"),
+]
+
+
+def ask_build_settings() -> dict | None:
+    """Optional build overrides. Returns {} to let the platform auto-detect,
+    or None if the user backed out."""
+    choice = menu("Build settings",
+                  ["Detect them for me (recommended)", "Set them myself"],
+                  "AletCloud inspects the repository and picks these automatically")
+    if choice is None:
+        return None
+    if choice == 0:
+        return {}
+
+    labels = [label for label, _ in FRAMEWORK_HINTS] + ["Something else — let me type it",
+                                                        "Leave it to auto-detection"]
+    pick = menu("Framework", labels, "What is this repository built with?")
+    if pick is None:
+        return None
+    if pick < len(FRAMEWORK_HINTS):
+        framework = FRAMEWORK_HINTS[pick][1]
+    elif pick == len(FRAMEWORK_HINTS):
+        header("Build settings", "Framework")
+        print(f"  {GREY}Examples the platform recognises: STATIC, NODEJS, ANGULAR, VITE,{RESET}")
+        print(f"  {GREY}SPRING_BOOT. If it isn't recognised the deploy is rejected with a{RESET}")
+        print(f"  {GREY}message saying so — nothing is created.{RESET}\n")
+        framework = ask("Framework", required=False) or None
+        if framework:
+            framework = framework.strip().upper()
+    else:
+        framework = None
+
+    header("Build settings", "Leave anything blank to let AletCloud decide")
+    build = ask("Build command", required=False)
+    if build is None:
+        return None
+    output = ask("Publish directory (static builds)", required=False)
+    if output is None:
+        return None
+    root = ask("Root directory (monorepos)", required=False)
+    if root is None:
+        return None
+    port = ask_int("Port the app listens on", required=False)
+
+    return {"framework": framework, "buildCommand": build or None,
+            "outputDir": output or None, "rootDir": root or None,
+            "containerPort": port}
+
+
+def app_deploy():
+    projects = load("hosting projects", "listHostingProjects")
+    if projects is None:
+        return
+    if not projects:
+        clear_screen()
+        print(f"\n  {GREY}Apps live inside a project, and you don't have one yet.{RESET}")
+        print(f"  {GREY}Create a project first from the Hosting Projects screen.{RESET}")
+        pause()
+        return
+    project = pick_from(projects, lambda p: f"{trunc(v(p, 'name'), 28):<28} {GREY}{v(p, 'primaryDomain', '')}{RESET}",
+                        "Deploy into which project?")
+    if not project:
+        return
+
+    header("Deploy an app", f"Into {v(project, 'name')}")
+    print(f"  {GREY}Build settings are detected automatically — you can override them{RESET}")
+    print(f"  {GREY}at the end if the detection gets it wrong.{RESET}\n")
+    name = ask("App name")
+    if not name:
+        return
+    repo = ask("GitHub repository URL")
+    if not repo:
+        return
+    branch = ask("Branch", "main")
+    plan = pick_plan("hosting", "listHostingPlans",
+                     lambda p: (f"{trunc(v(p, 'name'), 10):<10} {GREY}{v(p, 'cpuLimit')} CPU  "
+                                f"{v(p, 'memoryLimit'):<8} up to {v(p, 'maxApps')} apps   "
+                                f"{fmt_etb(p.get('priceMonthly'))}/mo{RESET}"))
+    if not plan:
+        return
+    settings = ask_build_settings()
+    if settings is None:
+        return
+
+    summary = f"{v(settings, 'framework', 'auto-detected build')} · {branch}"
+    if not confirm(f"Deploy '{name}' ({summary})?"):
+        return
+    act("Starting the build", f"{name} is building. Watch its status in the app list.",
+        "deployApp", {"projectId": project["id"], "appName": name, "githubRepoUrl": repo,
+                      "branch": branch, "planId": plan["id"], **settings})
+
+
+def app_delete(a: dict):
+    if not danger_confirm(f"Delete '{v(a, 'appName')}'?",
+                          "The app, its builds and its URL are removed permanently."):
+        return
+    act("Deleting", f"{v(a, 'appName')} has been deleted.", "deleteApp", {"appId": a["id"]})
+    return "back"
+
+
+def app_simple(a: dict, verb: str, done: str, tool: str):
+    def run():
+        if not confirm(f"{verb} '{v(a, 'appName')}'?"):
+            return
+        act(f"{verb}ing {v(a, 'appName')}", done, tool, {"appId": a["id"]})
+        return "back"
+    return run
+
+
+def open_app(a: dict):
+    status = str(v(a, "status", "")).upper()
+    opts: list[tuple[str, object]] = [
+        ("View details", lambda: print_app_detail(a)),
+        ("View logs", lambda: app_logs(a)),
+        ("Environment variables", lambda: app_env(a)),
+        ("Redeploy latest commit", app_simple(a, "Redeploy", f"Build started for {v(a, 'appName')}.", "redeployApp")),
+        ("Restart", app_simple(a, "Restart", f"{v(a, 'appName')} is restarting.", "restartApp")),
+    ]
+    if status == "LIVE":
+        opts.append(("Stop", app_simple(a, "Stop", f"{v(a, 'appName')} has been stopped.", "stopApp")))
+    opts += [
+        ("Set URL path", lambda: app_route(a)),
+        ("Configure domain", lambda: app_domain(a)),
+        ("Delete", lambda: app_delete(a)),
+    ]
+    actions(f"App: {v(a, 'appName')}", f"{paint(status)}   {v(a, 'framework')}   {v(a, 'url', '')}", opts)
+
+
+def screen_apps():
+    browse("App Hosting", "Choose an app",
+           lambda: load("apps", "listApps"),
+           app_label, open_app,
+           "＋  Deploy an app from GitHub", app_deploy,
+           "You haven't deployed any apps yet.")
+
+
+# ── Managed Databases ─────────────────────────────────────────────────────────
+def db_label(d: dict) -> str:
+    tag = f" {GREY}[trial]{RESET}" if d.get("free") else ""
+    return (f"{_engine_icon(v(d, 'engine', ''))} {trunc(v(d, 'name'), 24):<24} "
+            f"{status_cell(v(d, 'status', '?'))} "
+            f"{GREY}{trunc(v(d, 'engine'), 11):<11} {trunc(v(d, 'planName'), 8)}{RESET}{tag}")
+
+
+def print_db_detail(d: dict):
+    d = refreshed(d, "getDatabase", "instanceId")
+    engine = v(d, "engine")
+    header(f"{_engine_icon(engine)}  {v(d, 'name')}",
+           f"Managed database   {paint(v(d, 'status', '?'))}")
+    kv("Engine", f"{engine} {v(d, 'version', '')}".strip())
+    kv("Plan", v(d, "planName"))
+    kv("Database", v(d, "databaseName"))
+    kv("Username", v(d, "adminUsername"))
+    kv("CPU limit", v(d, "cpuLimit"))
+    kv("Memory", v(d, "memoryLimit"))
+    kv("Storage", v(d, "storageSize"))
+    kv("Max conns", v(d, "maxConnections"))
+    kv("Public access", "Enabled" if d.get("publicAccess") else "Disabled")
+    kv("External IP", v(d, "externalIp"))
+    kv("External port", v(d, "externalPort"))
+    kv("Internal host", v(d, "internalHost"))
+    kv("Price", "Free (trial)" if d.get("free") else f"{fmt_etb(d.get('pricePerMonth'))}/mo")
+    kv("Trial ends", fmt_dt(d.get("trialEndsAt"), 10))
+    kv("Backups", f"Every day, {d.get('backupRetentionDays', '?')} day retention"
+       if d.get("autoBackupEnabled") else "Disabled")
+    kv("Created", fmt_dt(d.get("createdAt")))
+    if d.get("statusMessage"):
+        print(f"\n  {YELLOW}{d['statusMessage']}{RESET}")
+    pause()
+
+
+def db_credentials(d: dict):
+    data = load(f"credentials for {v(d, 'name')}", "getDatabaseCredentials",
+                {"instanceId": d["id"]})
+    if data is None:
+        return
+    if not isinstance(data, dict):
+        data = {}
+    header(v(d, "name"), "Connection credentials")
+    print(f"  {YELLOW}These are secrets — treat them like a password.{RESET}\n")
+    kv("Host", v(data, "host", v(d, "externalIp")))
+    kv("Port", v(data, "port", v(d, "externalPort")))
+    kv("Database", v(data, "database", v(d, "databaseName")))
+    kv("Username", v(data, "username", v(d, "adminUsername")))
+    kv("Password", v(data, "password"))
+    conn = data.get("connectionString") or d.get("externalConnectionString")
+    if conn:
+        print(f"\n  {GREY}Connect with:{RESET}\n")
+        print(f"  {LIME}{conn}{RESET}")
+    pause()
+
+
+def db_logs(d: dict):
+    data = load(f"logs for {v(d, 'name')}", "databaseLogs", {"instanceId": d["id"], "lines": 300})
+    if data is None:
+        return
+    lines = data.get("lines") if isinstance(data, dict) else data
+    if isinstance(lines, str):
+        lines = lines.splitlines()
+    show_lines(f"{v(d, 'name')} — logs", "Most recent first", lines or [], "No log output yet.")
+
+
+def db_create():
+    engine = pick_from(["POSTGRESQL", "MYSQL", "MONGODB"],
+                       lambda e: f"{_engine_icon(e)}  {e.title()}",
+                       "New database", "Choose an engine")
+    if not engine:
+        return
+    plan = pick_plan("database", "listDatabasePlans",
+                     lambda p: (f"{trunc(v(p, 'name'), 10):<10} {GREY}{v(p, 'cpuLimit')} CPU  "
+                                f"{v(p, 'memoryLimit'):<8} {v(p, 'storageSize'):<7} "
+                                f"{v(p, 'maxConnections')} conns   "
+                                f"{fmt_etb(p.get('pricePerMonth'))}/mo{RESET}"),
+                     {"engine": engine})
+    if not plan:
+        return
+    header("New database", f"{engine.title()} — {v(plan, 'name')}")
+    name = ask("Name")
+    if not name:
+        return
+    if not confirm(f"Create the {engine.title()} database '{name}'?"):
+        return
+    act("Provisioning the database", f"{name} is provisioning. It appears in the list shortly.",
+        "createDatabase", {"engine": engine, "planId": plan["id"], "name": name})
+
+
+def db_delete(d: dict):
+    if not danger_confirm(f"Delete '{v(d, 'name')}'?",
+                          "The instance and every row of data in it are destroyed permanently."):
+        return
+    act("Deleting", f"{v(d, 'name')} has been deleted.", "deleteDatabase", {"instanceId": d["id"]})
+    return "back"
+
+
+def db_power(d: dict, verb: str, tool: str):
+    def run():
+        if not confirm(f"{verb} '{v(d, 'name')}'?"):
+            return
+        act(f"{verb}ing {v(d, 'name')}", f"{verb} sent for {v(d, 'name')}.",
+            tool, {"instanceId": d["id"]})
+        return "back"
+    return run
+
+
+def open_db(d: dict):
+    status = str(v(d, "status", "")).upper()
+    opts: list[tuple[str, object]] = [
+        ("View details", lambda: print_db_detail(d)),
+        ("Show connection credentials", lambda: db_credentials(d)),
+        ("View logs", lambda: db_logs(d)),
+    ]
+    if status == "STOPPED":
+        opts.append(("Start", db_power(d, "Start", "startDatabase")))
+    if status == "RUNNING":
+        opts.append(("Stop", db_power(d, "Stop", "stopDatabase")))
+        opts.append(("Restart", db_power(d, "Restart", "restartDatabase")))
+    opts.append(("Delete", lambda: db_delete(d)))
+    actions(f"DB: {v(d, 'name')}",
+            f"{v(d, 'engine')} {v(d, 'version', '')}   {paint(status)}   {v(d, 'planName')}", opts)
+
+
+def screen_databases():
+    browse("Managed Databases", "Choose a database",
+           lambda: load("databases", "listDatabases"),
+           db_label, open_db,
+           "＋  New database", db_create,
+           "You don't have any databases yet.")
+
+
+# ── Object Storage ────────────────────────────────────────────────────────────
+def bucket_label(b: dict) -> str:
+    used, quota = b.get("usedBytes") or 0, b.get("quotaBytes") or 0
+    pct = f"{(used / quota * 100):.0f}%" if quota else "—"
+    vis = "public" if str(v(b, "visibility", "")).startswith("PUBLIC") else "private"
+    return (f"{trunc(v(b, 'name'), 24):<24} {status_cell(v(b, 'status', '?'))} "
+            f"{GREY}{v(b, 'planName', ''):<6} {pct:>4} used  {vis}{RESET}")
+
+
+def print_bucket_detail(b: dict):
+    b = refreshed(b, "getBucket", "bucketId")
+    used, quota = b.get("usedBytes") or 0, b.get("quotaBytes") or 0
+    header(v(b, "name"), f"Object storage   {paint(v(b, 'status', '?'))}")
+    kv("Tier", f"{v(b, 'planName')}  ({fmt_etb(b.get('pricePerMonth'))}/mo)")
+    if quota:
+        kv("Used", f"{bar(used / quota)}  {fmt_bytes(used)} of {fmt_bytes(quota)}")
+    kv("Objects", f"{b.get('objectCount', 0):,}")
+    kv("Visibility", "Public — anyone can read objects" if str(v(b, "visibility", "")).startswith("PUBLIC")
+       else "Private — access keys only")
+    kv("Versioning", "Enabled" if b.get("versioningEnabled") else "Disabled")
+    kv("Region", v(b, "region"))
+    kv("S3 bucket", v(b, "s3BucketName"))
+    kv("Endpoint", f"{LIME}{v(b, 'endpoint')}{RESET}")
+    if b.get("publicUrl") and str(v(b, "visibility", "")).startswith("PUBLIC"):
+        kv("Public URL", f"{LIME}{b['publicUrl']}{RESET}")
+    kv("Created", fmt_dt(b.get("createdAt")))
+    pause()
+
+
+def bucket_refresh_usage(b: dict):
+    data = load(f"usage for {v(b, 'name')}", "bucketUsage", {"bucketId": b["id"]})
+    if data is None:
+        return
+    used = data.get("usedBytes", b.get("usedBytes")) if isinstance(data, dict) else b.get("usedBytes")
+    count = data.get("objectCount", b.get("objectCount")) if isinstance(data, dict) else b.get("objectCount")
+    quota = b.get("quotaBytes") or 0
+    header(v(b, "name"), "Usage, freshly measured")
+    if quota:
+        kv("Used", f"{bar((used or 0) / quota)}  {fmt_bytes(used)} of {fmt_bytes(quota)}")
+    else:
+        kv("Used", fmt_bytes(used))
+    kv("Objects", f"{count or 0:,}")
+    pause()
+
+
+def _show_secret(title: str, rows: list[tuple[str, str]]):
+    header(title, "Save these now")
+    print(f"  {YELLOW}The secret is shown once and cannot be retrieved again.{RESET}\n")
+    for label, value in rows:
+        kv(label, f"{LIME}{value}{RESET}" if value else "—")
+    pause()
+
+
+def bucket_keys(b: dict):
+    while True:
+        keys = load(f"access keys for {v(b, 'name')}", "listBucketAccessKeys", {"bucketId": b["id"]})
+        if keys is None:
+            return
+        rows = [f"{trunc(v(k, 'label', 'unlabelled'), 22):<22} {GREY}{v(k, 'accessKeyId')}   "
+                f"{'active' if k.get('active') else 'revoked'}{RESET}" for k in keys]
+        choice = menu(f"{v(b, 'name')} — access keys",
+                      rows + ["＋  Create a key for this bucket", "← Back"],
+                      "Each key reaches this bucket only")
+        if choice is None or choice == len(rows) + 1:
+            return
+        if choice == len(rows):
+            label = ask("Label for the new key", required=False)
+            if label is None:
+                continue
+            loading("Creating the key")
+            try:
+                created = call("createBucketAccessKey", {"bucketId": b["id"], "label": label or None})
+            except AletError as e:
+                error_screen("Could not create the key", e)
+                continue
+            created = created if isinstance(created, dict) else {}
+            _show_secret(f"New key for {v(b, 'name')}", [
+                ("Access key ID", v(created, "accessKeyId")),
+                ("Secret key", v(created, "secretKey")),
+                ("Endpoint", v(created, "endpoint", v(b, "endpoint"))),
+                ("Region", v(created, "region", v(b, "region"))),
+            ])
+        else:
+            k = keys[choice]
+            if not danger_confirm(f"Revoke '{v(k, 'label', v(k, 'accessKeyId'))}'?",
+                                  "Anything still using this key loses access to the bucket immediately."):
+                continue
+            act("Revoking the key", "The key has been revoked.",
+                "deleteBucketAccessKey", {"bucketId": b["id"], "keyId": k["id"]})
+
+
+def bucket_visibility(b: dict):
+    current = str(v(b, "visibility", "PRIVATE"))
+    choice = menu(f"{v(b, 'name')} — visibility",
+                  ["Private — access keys only", "Public — anyone can read objects", "← Back"],
+                  f"Currently: {current}")
+    if choice is None or choice == 2:
+        return
+    target = "PRIVATE" if choice == 0 else "PUBLIC_READ"
+    if target == current:
+        return
+    if target == "PUBLIC_READ":
+        if not danger_confirm(f"Make '{v(b, 'name')}' publicly readable?",
+                              "Every object in the bucket becomes readable by anyone on the internet."):
+            return
+    elif not confirm(f"Make '{v(b, 'name')}' private?"):
+        return
+    act("Updating visibility", f"{v(b, 'name')} is now {'public' if choice else 'private'}.",
+        "setBucketVisibility", {"bucketId": b["id"], "visibility": target})
+
+
+def bucket_resize(b: dict):
+    plan = pick_plan("storage", "listStoragePlans",
+                     lambda p: (f"{trunc(v(p, 'name'), 8):<8} {GREY}{v(p, 'storageGb')} GB   "
+                                f"{fmt_etb(p.get('pricePerMonth'))}/mo{RESET}"))
+    if not plan:
+        return
+    if not confirm(f"Move '{v(b, 'name')}' to the {v(plan, 'name')} tier?"):
+        return
+    act("Changing the tier", f"{v(b, 'name')} is now on {v(plan, 'name')}.",
+        "resizeBucket", {"bucketId": b["id"], "planId": plan["id"]})
+
+
+def bucket_link(b: dict):
+    header(v(b, "name"), "Temporary link to one object")
+    print(f"  {GREY}Creates a link that works without any credentials, then expires.{RESET}\n")
+    key = ask("Object key (e.g. uploads/photo.jpg)")
+    if not key:
+        return
+    direction = menu("What is the link for?",
+                     ["Downloading the object", "Uploading to that key", "← Back"])
+    if direction is None or direction == 2:
+        return
+    hours = ask_int("Valid for how many hours?", 1) or 1
+    loading("Creating the link")
+    try:
+        data = call("presignUrl", {"bucketId": b["id"], "objectKey": key,
+                                   "method": "GET" if direction == 0 else "PUT",
+                                   "expirySeconds": hours * 3600})
+    except AletError as e:
+        error_screen("Could not create the link", e)
+        return
+    url = data.get("url") if isinstance(data, dict) else data
+    header(v(b, "name"), f"Temporary link — {key}")
+    print(f"  {GREY}Valid for {hours} hour(s). Anyone with this link can use it.{RESET}\n")
+    print(f"  {LIME}{url}{RESET}")
+    pause()
+
+
+def bucket_connect(b: dict):
+    apps = load("apps", "listApps")
+    if apps is None:
+        return
+    if not apps:
+        clear_screen()
+        print(f"\n  {GREY}You don't have any apps to connect this bucket to.{RESET}")
+        pause()
+        return
+    app = pick_from(apps, app_label, f"Connect {v(b, 'name')} to which app?",
+                    "A dedicated key is minted for that app")
+    if not app:
+        return
+    if not confirm(f"Wire '{v(b, 'name')}' into '{v(app, 'appName')}'?"):
+        return
+    loading("Creating the connection")
+    try:
+        data = call("connectBucketToApp", {"bucketId": b["id"], "appId": app["id"]})
+    except AletError as e:
+        error_screen("Could not connect the bucket", e)
+        return
+    env = (data.get("envVars") if isinstance(data, dict) else None) or (data if isinstance(data, dict) else {})
+    header(f"{v(b, 'name')} → {v(app, 'appName')}", "Add these to the app's environment")
+    print(f"  {YELLOW}The secret is shown once.{RESET}\n")
+    for k, val in env.items():
+        if not isinstance(val, (dict, list)):
+            kv(k, f"{LIME}{val}{RESET}", 26)
+    pause()
+
+
+def bucket_delete(b: dict):
+    if not danger_confirm(f"Delete '{v(b, 'name')}'?",
+                          f"The bucket and all {b.get('objectCount', 0)} object(s) in it are destroyed permanently."):
+        return
+    act("Deleting", f"{v(b, 'name')} has been deleted.", "deleteBucket", {"bucketId": b["id"]})
+    return "back"
+
+
+def bucket_create():
+    header("New bucket", "S3-compatible object storage")
+    name = ask("Name")
+    if not name:
+        return
+    plan = pick_plan("storage", "listStoragePlans",
+                     lambda p: (f"{trunc(v(p, 'name'), 8):<8} {GREY}{v(p, 'storageGb')} GB   "
+                                f"{fmt_etb(p.get('pricePerMonth'))}/mo{RESET}"))
+    if not plan:
+        return
+    public = menu("Who can read objects in this bucket?",
+                  ["Only my access keys (private)", "Anyone on the internet (public)"])
+    if public is None:
+        return
+    versioning = ask_yes_no("Keep previous versions of overwritten objects?")
+    if not confirm(f"Create the {v(plan, 'name')} bucket '{name}'?"):
+        return
+    act("Creating the bucket", f"{name} is ready.",
+        "createBucket", {"name": name, "planId": plan["id"],
+                         "visibility": "PUBLIC_READ" if public == 1 else "PRIVATE",
+                         "versioningEnabled": versioning})
+
+
+def open_bucket(b: dict):
+    actions(f"Bucket: {v(b, 'name')}",
+            f"{paint(v(b, 'status', '?'))}   {v(b, 'planName')}   "
+            f"{fmt_bytes(b.get('usedBytes'))} used   {v(b, 'visibility')}",
+            [("View details", lambda: print_bucket_detail(b)),
+             ("Refresh usage", lambda: bucket_refresh_usage(b)),
+             ("Access keys", lambda: bucket_keys(b)),
+             ("Temporary object link", lambda: bucket_link(b)),
+             ("Connect to an app", lambda: bucket_connect(b)),
+             ("Change visibility", lambda: bucket_visibility(b)),
+             ("Change storage tier", lambda: bucket_resize(b)),
+             ("Delete", lambda: bucket_delete(b))])
+
+
+def screen_account_keys():
+    while True:
+        keys = load("account-wide access keys", "listStorageAccessKeys")
+        if keys is None:
+            return
+        rows = [f"{trunc(v(k, 'label', 'unlabelled'), 22):<22} {GREY}{v(k, 'accessKeyId')}   "
+                f"{'active' if k.get('active') else 'revoked'}   "
+                f"{'last used ' + fmt_dt(k.get('lastUsedAt'), 10) if k.get('lastUsedAt') else 'never used'}"
+                f"{RESET}" for k in keys]
+        choice = menu("Account-wide access keys",
+                      rows + ["＋  Create an account-wide key", "← Back"],
+                      "These reach every bucket — prefer per-bucket keys where you can")
+        if choice is None or choice == len(rows) + 1:
+            return
+        if choice == len(rows):
+            label = ask("Label for the new key", required=False)
+            if label is None:
+                continue
+            if not danger_confirm("Create an account-wide key?",
+                                  "This key can read and write every bucket you own."):
+                continue
+            loading("Creating the key")
+            try:
+                created = call("createStorageAccessKey", {"label": label or None})
+            except AletError as e:
+                error_screen("Could not create the key", e)
+                continue
+            created = created if isinstance(created, dict) else {}
+            _show_secret("New account-wide key", [
+                ("Access key ID", v(created, "accessKeyId")),
+                ("Secret key", v(created, "secretKey")),
+                ("Endpoint", v(created, "endpoint")),
+                ("Region", v(created, "region")),
+            ])
+        else:
+            k = keys[choice]
+            if not danger_confirm(f"Revoke '{v(k, 'label', v(k, 'accessKeyId'))}'?",
+                                  "Anything using this key loses access to every bucket immediately."):
+                continue
+            act("Revoking the key", "The key has been revoked.",
+                "deleteStorageAccessKey", {"keyId": k["id"]})
+
+
+def screen_storage():
+    while True:
+        choice = menu("Object Storage", ["Buckets", "Account-wide access keys", "← Back"],
+                      "S3-compatible storage")
+        if choice is None or choice == 2:
+            return
+        if choice == 0:
+            browse("Buckets", "Choose a bucket",
+                   lambda: load("buckets", "listBuckets"),
+                   bucket_label, open_bucket,
+                   "＋  New bucket", bucket_create,
+                   "You don't have any buckets yet.")
+        else:
+            screen_account_keys()
+
+
+# ── Domains & DNS ─────────────────────────────────────────────────────────────
+def domain_label(d: dict) -> str:
+    return (f"{trunc(v(d, 'name', v(d, 'domainName')), 30):<30} "
+            f"{status_cell(v(d, 'status', '?'))} {GREY}expires {fmt_dt(d.get('expiresAt'), 10)}{RESET}")
+
+
+def _domain_name(d: dict) -> str:
+    return v(d, "name", v(d, "domainName", "domain"))
+
+
+def dns_records(d: dict):
+    while True:
+        records = load(f"DNS records for {_domain_name(d)}", "getDnsRecords", {"domainId": d["id"]})
+        if records is None:
+            return
+        rows = [f"{v(r, 'type', ''):<7} {trunc(v(r, 'host', '@'), 24):<24} "
+                f"{GREY}{trunc(v(r, 'value', ''), 34):<34} TTL {v(r, 'ttl', '')}{RESET}"
+                for r in records]
+        choice = menu(f"{_domain_name(d)} — DNS records",
+                      rows + ["＋  Add a record", "← Back"],
+                      f"{len(records)} record(s)")
+        if choice is None or choice == len(rows) + 1:
+            return
+        if choice == len(rows):
+            dns_edit(d, None)
+        else:
+            r = records[choice]
+            sub = menu(f"{v(r, 'type')} {v(r, 'host')}", ["Edit", "Delete", "← Back"],
+                       trunc(v(r, "value", ""), 60))
+            if sub == 0:
+                dns_edit(d, r)
+            elif sub == 1:
+                if danger_confirm(f"Delete the {v(r, 'type')} record for {v(r, 'host')}?",
+                                  "Anything resolving through this record stops working."):
+                    act("Deleting the record", "Record deleted.",
+                        "deleteDnsRecord", {"domainId": d["id"], "recordId": r["id"]})
+
+
+def dns_edit(d: dict, record: dict | None):
+    editing = record is not None
+    header(_domain_name(d), "Edit a DNS record" if editing else "Add a DNS record")
+    rtype = pick_from(["A", "AAAA", "CNAME", "TXT", "MX", "NS", "SRV", "CAA"],
+                      lambda t: t, "Record type",
+                      f"Currently {v(record, 'type')}" if editing else "")
+    if not rtype:
+        return
+    header(_domain_name(d), f"{rtype} record")
+    print(f"  {GREY}Use @ for the domain itself, or a name like 'www'.{RESET}\n")
+    host = ask("Host", v(record, "host", "@") if editing else "@")
+    if not host:
+        return
+    value = ask("Value", v(record, "value") if editing else None)
+    if not value:
+        return
+    ttl = ask_int("TTL (seconds)", record.get("ttl") if editing else 3600)
+    priority = ask_int("Priority", record.get("priority") if editing else None,
+                       required=False) if rtype in ("MX", "SRV") else None
+
+    args = {"domainId": d["id"], "type": rtype, "host": host, "value": value,
+            "ttl": ttl, "priority": priority}
+    if editing:
+        if not confirm(f"Update the {rtype} record for {host}?"):
+            return
+        args["recordId"] = record["id"]
+        act("Updating the record", "Record updated.", "updateDnsRecord", args)
+    else:
+        if not confirm(f"Add a {rtype} record for {host}?"):
+            return
+        act("Adding the record", "Record added.", "addDnsRecord", args)
+
+
+def domain_nameservers(d: dict):
+    data = load(f"nameservers for {_domain_name(d)}", "getNameservers", {"domainId": d["id"]})
+    if data is None:
+        return
+    servers = data if isinstance(data, list) else data.get("nameservers", []) if isinstance(data, dict) else []
+    header(_domain_name(d), "Nameservers")
+    if not servers:
+        print(f"  {GREY}No nameservers reported for this domain.{RESET}")
+    for s in servers:
+        print(f"  {LIME}{s}{RESET}")
+    pause()
+
+
+def domain_autoconfig(d: dict):
+    header(_domain_name(d), "Point this domain at AletCloud hosting")
+    print(f"  {GREY}Creates the root A record and a www alias for you.{RESET}")
+    print(f"  {GREY}Leave the IP blank to use the AletCloud hosting edge.{RESET}\n")
+    ip = ask("Target IP", required=False)
+    if ip is None:
+        return
+    if not confirm(f"Auto-configure DNS for {_domain_name(d)}?"):
+        return
+    act("Configuring DNS", f"{_domain_name(d)} now points at AletCloud.",
+        "autoConfigureDnsForHosting", {"domainId": d["id"], "targetIp": ip or None})
+
+
+def print_domain_detail(d: dict):
+    data = load(f"details for {_domain_name(d)}", "getDomain", {"domainId": d["id"]}) or d
+    if not isinstance(data, dict):
+        data = d
+    header(_domain_name(data), f"Domain   {paint(v(data, 'status', '?'))}")
+    kv("Registered", fmt_dt(data.get("registeredAt") or data.get("createdAt"), 10))
+    kv("Expires", fmt_dt(data.get("expiresAt"), 10))
+    kv("Auto-renew", "On" if data.get("autoRenew") else "Off")
+    kv("Privacy", "On" if data.get("privacyEnabled") else "Off")
+    kv("Records", len(data.get("dnsRecords") or []))
+    for ns in (data.get("nameservers") or []):
+        kv("Nameserver", ns)
+    pause()
+
+
+def open_domain(d: dict):
+    actions(f"Domain: {_domain_name(d)}",
+            f"{paint(v(d, 'status', '?'))}   expires {fmt_dt(d.get('expiresAt'), 10)}",
+            [("View details", lambda: print_domain_detail(d)),
+             ("DNS records", lambda: dns_records(d)),
+             ("Nameservers", lambda: domain_nameservers(d)),
+             ("Point at AletCloud hosting", lambda: domain_autoconfig(d))])
+
+
+def screen_domain_search():
+    header("Find a domain", "Check availability and price")
+    keyword = ask("Name to look for (without the .com)")
+    if not keyword:
+        return
+    tlds = ask("Extensions to check", "com,net,org,et")
+    results = load(f"availability for '{keyword}'", "searchDomains",
+                   {"keyword": keyword, "tlds": tlds})
+    if results is None:
+        return
+    if isinstance(results, dict):
+        results = results.get("results") or results.get("domains") or []
+    header("Find a domain", f"Results for '{keyword}'")
+    if not results:
+        print(f"  {GREY}No results came back.{RESET}")
+    for r in results:
+        if not isinstance(r, dict):
+            print(f"  {r}")
+            continue
+        name = v(r, "domain", v(r, "name"))
+        available = r.get("available")
+        mark = f"{GREEN}available{RESET}" if available else f"{GREY}taken{RESET}" if available is not None else ""
+        price = r.get("price") or r.get("registrationPrice")
+        print(f"  {trunc(name, 32):<32} {mark:<22} {GREY}{fmt_etb(price) if price else ''}{RESET}")
+    print(f"\n  {GREY}Registration happens in the AletCloud console.{RESET}")
+    pause()
+
+
+def screen_domain_plans():
+    plans = load("domain prices", "listDomainPlans")
+    if plans is None:
+        return
+    header("Domain prices", "Registration and renewal, per year")
+    for p in plans:
+        kv(v(p, "tld", v(p, "name")),
+           f"{fmt_etb(p.get('registrationPrice') or p.get('price'))} to register   "
+           f"{GREY}{fmt_etb(p.get('renewalPrice'))} to renew{RESET}", 12)
+    pause()
+
+
+def screen_domains():
+    while True:
+        choice = menu("Domains & DNS",
+                      ["My domains", "Find a domain", "Domain prices", "← Back"],
+                      "Registrations and DNS records")
+        if choice is None or choice == 3:
+            return
+        if choice == 0:
+            browse("My Domains", "Choose a domain",
+                   lambda: load("domains", "listDomains"),
+                   domain_label, open_domain,
+                   empty="You don't have any domains registered yet.")
+        elif choice == 1:
+            screen_domain_search()
+        else:
+            screen_domain_plans()
+
+
+# ── Hosting Projects ──────────────────────────────────────────────────────────
+def project_label(p: dict) -> str:
+    n = len(p.get("services") or [])
+    return (f"{trunc(v(p, 'name'), 28):<28} {GREY}{n} service{'' if n == 1 else 's':<3}  "
+            f"{trunc(v(p, 'primaryDomain', ''), 38)}{RESET}")
+
+
+def print_project_detail(p: dict):
+    header(v(p, "name"), f"Hosting project   {paint(v(p, 'status', '?'))}")
+    kv("Domain", f"{LIME}{v(p, 'primaryDomain')}{RESET}")
+    kv("Description", v(p, "description"))
+    kv("Created", fmt_dt(p.get("createdAt")))
+    services = p.get("services") or []
+    print(f"\n  {GREY}Services ({len(services)}):{RESET}\n")
+    if not services:
+        print(f"    {GREY}No apps deployed into this project yet.{RESET}")
+    for s in services:
+        print(f"    {dot(v(s, 'status', ''))}  {v(s, 'icon', ' ')} {trunc(v(s, 'name'), 26):<26} "
+              f"{GREY}{trunc(v(s, 'routePath', '/'), 12):<12} {v(s, 'resources', '')}{RESET}")
+    pause()
+
+
+def project_create():
+    header("New hosting project", "A project groups apps behind one shared domain")
+    name = ask("Name")
+    if not name:
+        return
+    description = ask("Description", required=False)
+    if not confirm(f"Create the project '{name}'?"):
+        return
+    act("Creating the project", f"{name} is ready — you can deploy apps into it now.",
+        "createHostingProject", {"name": name, "description": description or None})
+
+
+def screen_projects():
+    browse("Hosting Projects", "Choose a project",
+           lambda: load("hosting projects", "listHostingProjects"),
+           project_label, lambda p: print_project_detail(p),
+           "＋  New project", project_create,
+           "You don't have any hosting projects yet.")
+
+
+# ── VPN Access ────────────────────────────────────────────────────────────────
+def vpn_devices(state: dict):
+    while True:
+        devices = load("VPN devices", "listVpnDevices")
+        if devices is None:
+            return
+        rows = [f"{trunc(v(d, 'name'), 22):<22} {status_cell(v(d, 'status', '?'))} "
+                f"{GREY}{v(d, 'address'):<18} last seen {fmt_dt(d.get('lastHandshakeAt'), 16) if d.get('lastHandshakeAt') else 'never'}{RESET}"
+                for d in devices]
+        choice = menu("VPN devices", rows + ["＋  Add a device", "← Back"],
+                      f"{len(devices)} device(s) on {v(state, 'vpnSubnet', 'the tunnel')}")
+        if choice is None or choice == len(rows) + 1:
+            return
+        if choice == len(rows):
+            vpn_add_device()
+        else:
+            d = devices[choice]
+            if danger_confirm(f"Remove '{v(d, 'name')}'?",
+                              "The device loses access to the private network immediately."):
+                act("Removing the device", f"{v(d, 'name')} removed.",
+                    "removeVpnDevice", {"peerId": d["id"]})
+
+
+def vpn_add_device():
+    header("Add a VPN device", "You get a ready-to-use WireGuard configuration")
+    name = ask("Device name (e.g. laptop)")
+    if not name:
+        return
+    print(f"\n  {GREY}Leave the key blank and AletCloud generates a keypair for you.{RESET}\n")
+    pubkey = ask("WireGuard public key", required=False)
+    if pubkey is None:
+        return
+    loading("Adding the device")
+    try:
+        data = call("addVpnDevice", {"name": name, "clientPublicKey": pubkey or None})
+    except AletError as e:
+        error_screen("Could not add the device", e)
+        return
+    config = None
+    if isinstance(data, dict):
+        config = data.get("config") or data.get("wireguardConfig") or data.get("clientConfig")
+    if config:
+        header(f"VPN — {name}", "Save this as wg0.conf on the device")
+        print(f"  {YELLOW}Contains a private key. It is shown once.{RESET}\n")
+        for line in str(config).splitlines():
+            print(f"  {LIME}{line}{RESET}")
+        pause()
+    else:
+        clear_screen()
+        ok(f"{name} added to the VPN.")
+        if isinstance(data, dict):
+            print()
+            for k, val in data.items():
+                if not isinstance(val, (dict, list)):
+                    kv(k, val, 20)
+        pause()
+
+
+def screen_vpn():
+    while True:
+        state = load("VPN access", "getVpnAccess")
+        if state is None:
+            return
+        if not isinstance(state, dict):
+            state = {}
+        enabled = bool(state.get("enabled"))
+        status = v(state, "status", "DISABLED")
+        peers = state.get("peers") or []
+
+        panel = [f"  {GREY}{'Status':<18}{RESET} {paint(status)}"]
+        if enabled:
+            panel += [
+                f"  {GREY}{'Endpoint':<18}{RESET} {LIME}{v(state, 'endpoint')}{RESET}",
+                f"  {GREY}{'Private range':<18}{RESET} {v(state, 'vpnSubnet')}",
+                f"  {GREY}{'Devices':<18}{RESET} {len(peers)}",
+            ]
+        else:
+            panel.append(f"  {GREY}VPN Access is off. Turning it on takes about 30 seconds.{RESET}")
+
+        opts = (["Devices", "Turn VPN off"] if enabled else ["Turn VPN on"]) + ["Refresh", "← Back"]
+        choice = menu("VPN Access", opts, "Reach your private resources from anywhere", panel)
+        if choice is None or opts[choice] == "← Back":
+            return
+        picked = opts[choice]
+        if picked == "Devices":
+            vpn_devices(state)
+        elif picked == "Turn VPN on":
+            if confirm("Enable VPN Access?"):
+                act("Setting up the tunnel",
+                    "VPN Access is provisioning — give it about 30 seconds, then refresh.",
+                    "enableVpnAccess")
+        elif picked == "Turn VPN off":
+            if danger_confirm("Disable VPN Access?",
+                              f"All {len(peers)} device(s) are removed and the tunnel is torn down."):
+                act("Tearing down the tunnel", "VPN Access is being disabled.", "disableVpnAccess")
+
+
+# ── Billing & Usage ───────────────────────────────────────────────────────────
+def screen_balance():
+    b = load("your balance", "getBalance")
+    if b is None:
+        return
+    if not isinstance(b, dict):
+        b = {}
+    header("Wallet", "Balance and burn rate")
+    runway = b.get("hoursRemaining") or 0
+    kv("Balance", f"{BOLD_GREEN}{fmt_etb(b.get('balance'))}{RESET}")
+    kv("Burn rate", f"ETB {float(b.get('hourlyBurnRate') or 0):.4f} / hour")
+    kv("Runway", f"{runway:,.1f} hours  {GREY}(about {runway / 24:,.1f} days){RESET}")
+    kv("Active resources", b.get("activeVmCount", 0))
+    kv("Last top-up", fmt_dt(b.get("lastTopUpAt")))
+    if runway and runway < 72:
+        print(f"\n  {YELLOW}⚠  Less than three days of runway left.{RESET}")
+    pause()
+
+
+def screen_usage():
+    rows = load("this month's usage", "getUsage")
+    if rows is None:
+        return
+    if isinstance(rows, dict):
+        rows = rows.get("content") or rows.get("usage") or []
+
+    # The API returns one row per billing interval — thousands of them.
+    # Roll them up per resource so the screen answers "what am I paying for?".
+    totals: dict[tuple, dict] = {}
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        key = (v(r, "resourceType", "OTHER"), v(r, "vmName", "unnamed"))
+        agg = totals.setdefault(key, {"cost": 0.0, "minutes": 0, "plan": v(r, "planName", "")})
+        agg["cost"] += float(r.get("billedCost") or 0)
+        agg["minutes"] += int(r.get("billedMinutes") or 0)
+
+    if not totals:
+        header("Usage this month", "")
+        print(f"  {GREY}No usage recorded this month.{RESET}")
+        pause()
+        return
+
+    ordered = sorted(totals.items(), key=lambda item: -item[1]["cost"])
+    grand = sum(agg["cost"] for _, agg in ordered)
+    lines = [
+        f"  {trunc(name, 27):<28} {GREY}{trunc(rtype, 9):<10} {trunc(agg['plan'], 8):<9}{RESET} "
+        f"{agg['minutes'] / 60:>8,.1f} {fmt_etb(agg['cost']):>14}"
+        for (rtype, name), agg in ordered
+    ]
+    show_rows(
+        "Usage this month",
+        f"{len(rows):,} billing intervals rolled up",
+        lines,
+        column_head=f"  {GREY}{'RESOURCE':<28} {'TYPE':<10} {'PLAN':<9} {'HOURS':>8} {'COST':>14}{RESET}",
+        footer=[f"  {GREY}{'─' * 62}{RESET}",
+                f"  {BOLD_WHITE}{'Total so far this month':<48}{RESET}"
+                f"{BOLD_GREEN}{fmt_etb(grand):>14}{RESET}"],
+        unit="resources")
+
+
+def screen_transactions():
+    page = 0
+    while True:
+        data = load("your transactions", "getTransactions", {"page": page, "size": 20})
+        if data is None:
+            return
+        items = data.get("content", []) if isinstance(data, dict) else (data or [])
+        total_pages = data.get("totalPages", 1) if isinstance(data, dict) else 1
+        total = data.get("totalElements", len(items)) if isinstance(data, dict) else len(items)
+
+        header("Transactions", f"{total:,} entries — page {page + 1} of {max(total_pages, 1)}")
+        if not items:
+            print(f"  {GREY}No transactions on this page.{RESET}")
+        for t in items:
+            amount = float(t.get("amount") or 0)
+            color = RED if amount < 0 else GREEN
+            print(f"  {GREY}{fmt_dt(t.get('createdAt'), 16)}{RESET}  "
+                  f"{color}{amount:>12,.4f}{RESET}  "
+                  f"{GREY}{trunc(v(t, 'description', v(t, 'type', '')), 46)}{RESET}")
+        print(f"\n  {GREY}n  next page   p  previous page   q  back{RESET}")
+        key = getch()
+        if key in ("q", "\x1b\x1b", "\x03"):
+            return
+        if key in ("n", "\x1b[B", "j") and page < total_pages - 1:
+            page += 1
+        elif key in ("p", "\x1b[A", "k") and page > 0:
+            page -= 1
+
+
+def screen_billing():
+    while True:
+        choice = menu("Billing & Usage",
+                      ["Wallet balance", "Usage this month", "Transaction history", "← Back"],
+                      "What you have and what you're spending")
+        if choice is None or choice == 3:
+            return
+        (screen_balance, screen_usage, screen_transactions)[choice]()
+
+
+# ── Platform Status ───────────────────────────────────────────────────────────
+def screen_status():
+    data = load("platform status", "getPlatformStatus")
+    if data is None:
+        return
+    if not isinstance(data, dict):
+        data = {}
+    overall = v(data, "overall", "unknown")
+    header("Platform Status", f"As of {fmt_dt(data.get('as_of'), 19)}")
+    print(f"  {dot(overall)}  {BOLD_WHITE}{v(data, 'headline', 'Status unavailable.')}{RESET}\n")
+
+    for c in (data.get("components") or []):
+        uptime = num(c.get("uptime_percent_90d"))
+        uptime_txt = f"{uptime:.3f}% uptime (90d)" if uptime is not None else ""
+        print(f"  {dot(v(c, 'state', ''))}  {trunc(v(c, 'name'), 28):<28} "
+              f"{status_cell(v(c, 'state', '?'), 14)} {GREY}{uptime_txt}{RESET}")
+
+    coverage = data.get("coverage") or {}
+    unmonitored = coverage.get("not_monitored") or []
+    if unmonitored:
+        print(f"\n  {GREY}Not probed ({len(unmonitored)}): {', '.join(map(str, unmonitored))}{RESET}")
+        if coverage.get("note"):
+            print(f"  {GREY}{coverage['note']}{RESET}")
+    if data.get("status_page_url"):
+        print(f"\n  {GREY}Full status page: {RESET}{LIME}{data['status_page_url']}{RESET}")
+    pause()
+
+
+def screen_incidents():
+    data = load("incident history", "listPlatformIncidents")
+    if data is None:
+        return
+    if not isinstance(data, dict):
+        data = {}
+    incidents = data.get("incidents") or []
+    header("Incidents", "What broke, and when")
+    if not data.get("available", True) and not incidents:
+        print(f"  {YELLOW}{v(data, 'note', 'Incident history is unavailable right now.')}{RESET}")
+    elif not incidents:
+        print(f"  {GREEN}No incidents reported.{RESET}")
+    for i in incidents:
+        print(f"  {dot(v(i, 'status', ''))}  {BOLD_WHITE}{v(i, 'title', v(i, 'name'))}{RESET}")
+        print(f"      {GREY}{v(i, 'impact', '')}  started {fmt_dt(i.get('started_at') or i.get('startedAt'))}{RESET}")
+        for u in (i.get("updates") or [])[:3]:
+            print(f"      {GREY}· {trunc(v(u, 'body', v(u, 'message', '')), 70)}{RESET}")
+        print()
+    if data.get("status_page_url"):
+        print(f"  {GREY}Full status page: {RESET}{LIME}{data['status_page_url']}{RESET}")
+    pause()
+
+
+def screen_maintenance():
+    data = load("the maintenance schedule", "getMaintenanceSchedule")
+    if data is None:
+        return
+    if not isinstance(data, dict):
+        data = {}
+    windows = data.get("maintenances") or []
+    header("Maintenance", "Planned work on the platform")
+    if data.get("standing_window"):
+        kv("Regular window", data["standing_window"], 20)
+        print()
+    if not windows:
+        print(f"  {GREY}{v(data, 'note', 'No maintenance is currently scheduled.')}{RESET}")
+    for w in windows:
+        print(f"  {dot(v(w, 'status', ''))}  {BOLD_WHITE}{v(w, 'title', v(w, 'name'))}{RESET}")
+        print(f"      {GREY}{fmt_dt(w.get('starts_at') or w.get('startsAt'))} → "
+              f"{fmt_dt(w.get('ends_at') or w.get('endsAt'))}{RESET}")
+        if w.get("description"):
+            print(f"      {GREY}{trunc(w['description'], 70)}{RESET}")
+    pause()
+
+
+def screen_uptime():
+    data = load("uptime history", "getComponentHistory")
+    if data is None:
+        return
+    components = data.get("components") if isinstance(data, dict) else data
+    if not components:
+        header("Uptime history", "Has this been flaky?")
+        note = v(data, "note", "No history available.") if isinstance(data, dict) else "No history available."
+        print(f"  {GREY}{note}{RESET}")
+        pause()
+        return
+
+    span = max((c.get("history_days_available") or 0)
+               for c in components if isinstance(c, dict))
+    rows = []
+    for c in components:
+        if not isinstance(c, dict):
+            continue
+        uptime = num(c.get("uptime_percent") or c.get("uptime_percent_90d"))
+        bad_days = c.get("days_with_incidents") or []
+        pct = (f"{_state_color('OPERATIONAL' if not bad_days else 'DEGRADED')}{uptime:>8.3f}%{RESET}"
+               if uptime is not None else f"{GREY}{'—':>9}{RESET}")
+        rows.append(f"  {dot(v(c, 'current_state', ''))}  {trunc(v(c, 'name', v(c, 'id')), 26):<26} {pct}   "
+                    f"{GREY}{len(bad_days)} bad day{'' if len(bad_days) == 1 else 's'}{RESET}")
+        for day in bad_days:
+            if not isinstance(day, dict):
+                continue
+            down = day.get("down_samples") or 0
+            degraded = day.get("degraded_samples") or 0
+            parts = ([f"{down} down"] if down else []) + ([f"{degraded} degraded"] if degraded else [])
+            detail = ", ".join(parts) or "brief blip"
+            rows.append(f"        {GREY}{fmt_dt(day.get('date'), 10)}   {detail}{RESET}")
+
+    footer = None
+    if isinstance(data, dict) and data.get("status_page_url"):
+        footer = [f"  {GREY}Full status page: {RESET}{LIME}{data['status_page_url']}{RESET}"]
+    show_rows("Uptime history",
+              f"Last {span} days" if span else "Has this been flaky?",
+              rows, footer=footer, unit="lines")
+
+
+def screen_platform():
+    while True:
+        choice = menu("Platform Status",
+                      ["Is AletCloud up right now?", "Incidents", "Maintenance windows",
+                       "Uptime history", "← Back"],
+                      "Health of the platform itself")
+        if choice is None or choice == 4:
+            return
+        (screen_status, screen_incidents, screen_maintenance, screen_uptime)[choice]()
+
+
+# ── Main menu ─────────────────────────────────────────────────────────────────
+SECTIONS = [
+    ("Virtual Machines",   screen_vms),
+    ("App Hosting",        screen_apps),
+    ("Managed Databases",  screen_databases),
+    ("Object Storage",     screen_storage),
+    ("Domains & DNS",      screen_domains),
+    ("Hosting Projects",   screen_projects),
+    ("VPN Access",         screen_vpn),
+    ("Billing & Usage",    screen_billing),
+    ("Platform Status",    screen_platform),
+]
+
+
+def main_menu():
+    labels = [name for name, _ in SECTIONS] + ["Exit"]
+    while True:
+        choice = menu("AletCloud", labels, "Manage your cloud resources")
+        if choice is None or choice == len(labels) - 1:
+            return
+        SECTIONS[choice][1]()
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+SHORTCUTS = {
+    "vms": screen_vms, "apps": screen_apps, "dbs": screen_databases,
+    "storage": screen_storage, "domains": screen_domains, "projects": screen_projects,
+    "vpn": screen_vpn, "billing": screen_billing, "balance": screen_balance,
+    "usage": screen_usage, "status": screen_platform,
+}
+
+HELP = f"""\
+{BOLD}acc{RESET} — AletCloud CLI  {GREY}v{VERSION}{RESET}
+
+Usage:
+  acc                Launch the interactive menu
+  acc vms            Virtual machines
+  acc apps           Hosted apps
+  acc dbs            Managed databases
+  acc storage        Object storage buckets and keys
+  acc domains        Domains and DNS records
+  acc projects       Hosting projects
+  acc vpn            VPN access and devices
+  acc billing        Balance, usage and transactions
+  acc balance        Wallet balance only
+  acc usage          This month's usage only
+  acc status         Platform health, incidents, maintenance
+  acc help           Show this message
+  acc version        Show the version
+
+Authentication:
+  Reads ALET_PAT from the environment, {GREY}~/.config/aletcloud/config{RESET},
+  or {GREY}~/.aletcloudrc{RESET}. If none is set, acc asks for a token on first run.
+"""
+
+
+def main():
+    global PAT
+    _enable_ansi()
+    args = sys.argv[1:]
+
+    if args and args[0] in ("help", "--help", "-h"):
+        print(HELP)
+        return 0
+    if args and args[0] in ("version", "--version", "-v"):
+        print(f"acc {VERSION}")
+        return 0
+    if args and args[0] not in SHORTCUTS:
+        print(f"{RED}[Error]{RESET} Unknown command '{args[0]}'. Run 'acc help'.", file=sys.stderr)
+        return 1
+
+    PAT = _load_pat() or _prompt_for_pat()
+
+    loading("Connecting to AletCloud")
+    try:
+        connect()
+    except AletError as e:
+        print(f"\n  {RED}✗  Could not connect.{RESET}\n\n  {GREY}{e}{RESET}\n", file=sys.stderr)
+        return 1
+
+    enter_ui()
+    try:
+        if args:
+            SHORTCUTS[args[0]]()
+        else:
+            main_menu()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        exit_ui()
+    print(f"  {GREY}Goodbye.{RESET}\n")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
