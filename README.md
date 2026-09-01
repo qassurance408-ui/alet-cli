@@ -21,15 +21,21 @@ curl -fsSL https://raw.githubusercontent.com/qassurance408-ui/alet-cli/main/inst
 
 It checks that you have Python 3.10 or newer, downloads `acc`, verifies its
 SHA256 against the published checksum, and puts it in `~/.local/bin`. Run it
-again any time to upgrade. If `~/.local/bin` is not on your PATH it prints the
-line to add rather than editing your shell config behind your back.
+again any time to upgrade.
+
+If `~/.local/bin` is not already on your PATH, it adds the line to your shell
+rc (`~/.bashrc`, `~/.zshrc`, or `~/.profile` depending on your shell) so new
+terminals find `acc` without you doing anything. It only ever appends once, and
+`ACC_NO_MODIFY_PATH=1` turns that off. The shell you ran the installer from is
+a parent process, so nothing can change its PATH from the inside; the installer
+prints the one line to paste if you want `acc` in that shell right away.
 
 You can change what it does with environment variables:
 
 ```bash
 ACC_VERSION=v0.5 \
 ACC_INSTALL_DIR=/usr/local/bin \
-ACC_MODIFY_PATH=1 \
+ACC_NO_MODIFY_PATH=1 \
   sh -c "$(curl -fsSL https://raw.githubusercontent.com/qassurance408-ui/alet-cli/main/install.sh)"
 ```
 
@@ -37,7 +43,7 @@ ACC_MODIFY_PATH=1 \
 |---|---|---|
 | `ACC_VERSION` | `main` | tag or branch to install |
 | `ACC_INSTALL_DIR` | `~/.local/bin` | where the file goes |
-| `ACC_MODIFY_PATH` | unset | set to `1` to append the PATH line to your shell rc |
+| `ACC_NO_MODIFY_PATH` | unset | set to `1` to leave your shell rc alone |
 
 If you would rather not pipe a script into a shell, read it first or just copy
 the file yourself:

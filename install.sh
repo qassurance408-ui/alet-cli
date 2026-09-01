@@ -10,7 +10,7 @@
 #   ACC_VERSION      tag or branch to install       (default: main)
 #   ACC_INSTALL_DIR  where the file goes            (default: ~/.local/bin)
 #   ACC_BASE_URL     where to fetch from            (default: raw.githubusercontent.com)
-#   ACC_MODIFY_PATH  set to 1 to edit your shell rc (default: just print the line)
+#   ACC_NO_MODIFY_PATH  set to 1 to leave your shell rc alone
 
 set -eu
 
@@ -150,22 +150,75 @@ rc_file() {
     esac
 }
 
+# Debian and Ubuntu ship a ~/.profile that adds ~/.local/bin to PATH, but only
+# at login and only if the directory already exists. On a machine where it did
+# not, a logout and login is enough once this installer has created it.
+profile_covers_it() {
+    [ "$INSTALL_DIR" = "$HOME/.local/bin" ] || return 1
+    [ -f "$HOME/.profile" ] || return 1
+    grep -q '\.local/bin' "$HOME/.profile" 2>/dev/null
+}
+
+# Sets PATH_STATUS to one of: ok, rc_edited, rc_present, manual. The closing
+# message reads it, so it never tells anyone to run a command their shell
+# cannot find, and never claims to have written a line it did not write.
 handle_path() {
-    on_path && return 0
+    if on_path; then
+        PATH_STATUS="ok"
+        return 0
+    fi
 
-    line="export PATH=\"$INSTALL_DIR:\$PATH\""
-    rc="$(rc_file)"
+    LINE="export PATH=\"$INSTALL_DIR:\$PATH\""
+    RC="$(rc_file)"
 
-    if [ "${ACC_MODIFY_PATH:-}" = "1" ]; then
-        printf '\n%s\n' "$line" >> "$rc"
-        info "Added $INSTALL_DIR to PATH in $rc"
-        say "${GREY}Open a new shell, or run:${RESET}  . $rc"
+    if [ "${ACC_NO_MODIFY_PATH:-}" = "1" ]; then
+        PATH_STATUS="manual"
+        return 0
+    fi
+
+    # Already there from an earlier run, so do not stack a duplicate.
+    if [ -f "$RC" ] && grep -qF "$INSTALL_DIR" "$RC" 2>/dev/null; then
+        PATH_STATUS="rc_present"
+        return 0
+    fi
+
+    if { [ -f "$RC" ] || touch "$RC" 2>/dev/null; } &&
+       printf '\n# added by the acc installer\n%s\n' "$LINE" >> "$RC" 2>/dev/null; then
+        PATH_STATUS="rc_edited"
     else
+        PATH_STATUS="manual"
+    fi
+}
+
+report_path() {
+    case "$PATH_STATUS" in
+        ok) return 0 ;;
+        rc_edited)
+            printf '\n'
+            say "${BOLD}$INSTALL_DIR was not on your PATH, so it was added to $RC.${RESET}"
+            ;;
+        rc_present)
+            printf '\n'
+            say "${BOLD}$INSTALL_DIR is not on this shell's PATH, but $RC already adds it.${RESET}"
+            ;;
+        manual)
+            printf '\n'
+            say "${BOLD}$INSTALL_DIR is not on your PATH.${RESET}"
+            say "${GREY}Run this now, and add it to $RC to make it stick:${RESET}"
+            ;;
+    esac
+
+    if [ "$PATH_STATUS" != "manual" ]; then
         printf '\n'
-        say "${BOLD}$INSTALL_DIR is not on your PATH.${RESET}"
-        say "${GREY}Add this to $rc:${RESET}"
-        printf '\n      %s\n' "$line"
-        say "${GREY}Or re-run this installer with ACC_MODIFY_PATH=1 to do it for you.${RESET}"
+        say "${GREY}To use acc in this shell right now:${RESET}"
+    fi
+    printf '\n      %s\n\n' "$LINE"
+
+    if [ "$PATH_STATUS" != "manual" ]; then
+        say "${GREY}New terminals pick it up on their own.${RESET}"
+    fi
+    if profile_covers_it; then
+        say "${GREY}Logging out and back in also works, since ~/.profile adds it.${RESET}"
     fi
 }
 
@@ -202,8 +255,13 @@ main() {
 
     handle_path
     check_shadowing
+    report_path
 
-    printf '\n  %bRun "acc" to get started. It asks for a token on first run.%b\n\n' "$GREY" "$RESET"
+    if [ "$PATH_STATUS" = "ok" ]; then
+        printf '\n  %bRun "acc" to get started. It asks for a token on first run.%b\n\n' "$GREY" "$RESET"
+    else
+        printf '\n  %bThen run "acc". It asks for a token on first run.%b\n\n' "$GREY" "$RESET"
+    fi
 }
 
 main "$@"
