@@ -1,11 +1,4 @@
 #!/usr/bin/env python3
-"""acc — AletCloud CLI (MCP-backed).
-
-Same curated, abstracted feel as v4: human screens, friendly verbs, no MCP,
-no tool names, no JSON. Extended to cover the platform surfaces added since
-v4 — object storage, domains & DNS, VPN access, usage/transactions and
-platform status.
-"""
 import os
 import sys
 import json
