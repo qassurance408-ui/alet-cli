@@ -234,11 +234,12 @@ column width.
 
 ### Drawing
 
-Screens are written with plain `print()` calls, but a `_Painter` class takes the place of
-`sys.stdout` and buffers them. When something blocks on input, the whole
-screen goes out as a single write that homes the cursor and overwrites the
-previous frame in place. There is no erase step, so there is no blank moment.
-The session runs on the alternate screen buffer so your scrollback survives.
+Screens are written with plain `print()` calls, but a `_Painter` class takes
+the place of `sys.stdout` and buffers them. When something blocks on input, the
+whole screen goes out as a single write that homes the cursor and overwrites
+the previous frame in place. There is no erase step, so there is no blank
+moment. The session runs on the alternate screen buffer so your scrollback
+survives.
 
 The single write is what keeps it steady on Windows. Linux terminals batch a
 run of small writes into one render pass, so painting a screen line by line
